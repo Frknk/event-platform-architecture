@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Interacción opcional: certificado de Events a credencial HukID",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [860, 840],
+    "output": "diagrams/certificate-to-hukid.sequence.html",
+    "views": [
+      {
+        "id": "consent", "label": "Consentimiento y solicitud", "focus": ["participant", "operations", "hukid"],
+        "note": "Operations sólo solicita una emisión cuando existe certificado elegible y consentimiento vigente."
+      },
+      {
+        "id": "issuance", "label": "Oferta, holder binding y emisión", "focus": ["operations", "hukid", "wallet"],
+        "note": "HukID protege la emisión; la wallet conserva la clave del holder y la credencial resultante."
+      }
+    ]
+  },
+  "participants": [
+    { "id": "participant", "type": "external", "label": "Participante", "sublabel": "titular" },
+    { "id": "operations", "type": "backend", "label": "Operations", "sublabel": "Events" },
+    { "id": "hukid", "type": "external", "label": "HukID", "sublabel": "Integration API" },
+    { "id": "wallet", "type": "frontend", "label": "Wallet", "sublabel": "holder" }
+  ],
+  "segments": [
+    { "from": 150, "to": 356, "label": "Consentimiento y solicitud idempotente" },
+    { "from": 382, "to": 676, "label": "Emisión verificable en la wallet" }
+  ],
+  "messages": [
+    { "id": "eligible_certificate", "from": "operations", "to": "participant", "y": 184, "label": "certificado PDF elegible", "variant": "return" },
+    { "id": "consent", "from": "participant", "to": "operations", "y": 228, "label": "autoriza credencial", "variant": "security" },
+    { "id": "create_request", "from": "operations", "to": "hukid", "y": 292, "label": "POST con claims congelados + idempotency", "variant": "security" },
+    { "id": "offer", "from": "hukid", "to": "operations", "y": 336, "label": "offer opaca y estado", "variant": "return" },
+    { "id": "present_offer", "from": "operations", "to": "wallet", "y": 408, "label": "presenta offer al titular", "variant": "dashed" },
+    { "id": "accept", "from": "wallet", "to": "hukid", "y": 452, "label": "acepta offer y prueba holder", "variant": "security" },
+    { "id": "issue", "from": "hukid", "to": "wallet", "y": 496, "label": "credencial firmada + status", "variant": "return" },
+    { "id": "reconcile", "from": "hukid", "to": "operations", "y": 540, "label": "estado terminal", "variant": "dashed" },
+    { "id": "show_result", "from": "wallet", "to": "participant", "y": 584, "label": "credencial disponible", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "operations", "from": 178, "to": 544, "type": "backend" },
+    { "participant": "hukid", "from": 286, "to": 544, "type": "external" },
+    { "participant": "wallet", "from": 402, "to": 588, "type": "frontend" }
+  ],
+  "cards": [
+    {
+      "dot": "violet",
+      "title": "Boundary de HukID",
+      "items": [
+        "Operations es dueño del adaptador outbound y sólo persiste el ID/estado externo necesario.",
+        "HukID no consume el bus de Events ni comparte base de datos o autenticación de usuarios.",
+        "La wallet no entrega su clave privada a Events ni a HukID."
+      ]
+    }
+  ]
+}

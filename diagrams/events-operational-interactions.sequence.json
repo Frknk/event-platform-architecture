@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Interacciones detalladas: publicación, participación y operación",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1120, 1140],
+    "output": "diagrams/events-operational-interactions.sequence.html",
+    "views": [
+      {
+        "id": "release",
+        "label": "Publicación consistente",
+        "focus": ["manager", "configuration", "content", "participation", "onsite"],
+        "note": "Event Configuration publica un release completo; cada consumidor activa su propia proyección."
+      },
+      {
+        "id": "registration",
+        "label": "Registro o postulación",
+        "focus": ["participant", "content", "participation", "onsite"],
+        "note": "Content atiende lectura pública; Participation es la única autoridad de cupo, waitlist, admisibilidad y QR."
+      },
+      {
+        "id": "onsite_certificate",
+        "label": "Check-in y certificado",
+        "focus": ["staff", "onsite", "operations", "participant"],
+        "note": "Onsite crea hechos de asistencia y Operations emite evidencia sin modificar registros ni tickets."
+      }
+    ]
+  },
+  "participants": [
+    { "id": "manager", "type": "frontend", "label": "Manager" },
+    { "id": "configuration", "type": "backend", "label": "Event Config" },
+    { "id": "content", "type": "cloud", "label": "Content CMS" },
+    { "id": "participant", "type": "external", "label": "Participante" },
+    { "id": "participation", "type": "backend", "label": "Participation" },
+    { "id": "staff", "type": "frontend", "label": "Staff" },
+    { "id": "onsite", "type": "backend", "label": "Onsite" },
+    { "id": "operations", "type": "backend", "label": "Operations" }
+  ],
+  "segments": [
+    { "from": 150, "to": 342, "label": "1. Configurar y publicar" },
+    { "from": 368, "to": 606, "label": "2. Inscribirse o postular" },
+    { "from": 632, "to": 770, "label": "3. Operar el check-in" },
+    { "from": 796, "to": 996, "label": "4. Reportar y certificar" }
+  ],
+  "messages": [
+    { "id": "configure", "from": "manager", "to": "configuration", "y": 180, "label": "crea evento, agenda, cupo y formulario", "variant": "emphasis" },
+    { "id": "preview", "from": "configuration", "to": "manager", "y": 220, "label": "readiness y preview", "variant": "return" },
+    { "id": "release_content", "from": "configuration", "to": "content", "y": 260, "label": "release publicado", "variant": "dashed" },
+    { "id": "release_participation", "from": "configuration", "to": "participation", "y": 300, "label": "policy, form y hashes", "variant": "dashed" },
+    { "id": "release_onsite", "from": "configuration", "to": "onsite", "y": 340, "label": "agenda y scopes", "variant": "dashed" },
+
+    { "id": "browse", "from": "participant", "to": "content", "y": 394, "label": "consulta landing y agenda", "variant": "default" },
+    { "id": "public_snapshot", "from": "content", "to": "participant", "y": 434, "label": "snapshot público cacheable", "variant": "return" },
+    { "id": "submit", "from": "participant", "to": "participation", "y": 474, "label": "registro/postulación + consentimiento", "variant": "emphasis" },
+    { "id": "decision", "from": "participation", "to": "participant", "y": 514, "label": "confirmado, waitlist o revisión", "variant": "return" },
+    { "id": "availability", "from": "participation", "to": "content", "y": 554, "label": "disponibilidad pública", "variant": "dashed" },
+    { "id": "ticket_state", "from": "participation", "to": "onsite", "y": 594, "label": "ticket emitido o revocado", "variant": "dashed" },
+
+    { "id": "scan", "from": "staff", "to": "onsite", "y": 658, "label": "escanea QR o busca ticket", "variant": "emphasis" },
+    { "id": "checkin_result", "from": "onsite", "to": "staff", "y": 698, "label": "válido, duplicado o rechazado", "variant": "return" },
+    { "id": "attendance", "from": "onsite", "to": "operations", "y": 738, "label": "hecho de asistencia", "variant": "dashed" },
+
+    { "id": "report", "from": "manager", "to": "operations", "y": 822, "label": "solicita reporte autorizado", "variant": "security" },
+    { "id": "report_ready", "from": "operations", "to": "manager", "y": 862, "label": "job y enlace temporal", "variant": "return" },
+    { "id": "certificate", "from": "operations", "to": "participant", "y": 902, "label": "certificado si cumple regla", "variant": "return" },
+    { "id": "certificate_event", "from": "operations", "to": "manager", "y": 942, "label": "emisión y watermark", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "configuration", "from": 174, "to": 344, "type": "backend" },
+    { "participant": "content", "from": 254, "to": 556, "type": "cloud" },
+    { "participant": "participation", "from": 294, "to": 598, "type": "backend" },
+    { "participant": "onsite", "from": 334, "to": 742, "type": "backend" },
+    { "participant": "operations", "from": 732, "to": 946, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Autoridad de cada microservicio",
+      "items": [
+        "Content expone sólo proyecciones públicas; no consulta el registro durante una visita normal.",
+        "Participation decide cupo, waitlist, admisibilidad y ticket de forma local e idempotente.",
+        "Onsite valida tickets y registra asistencia, pero no modifica cupos ni registros."
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Regla de consistencia",
+      "items": [
+        "Configuration publica una release versionada con agenda, policy y formulario compatibles.",
+        "Content, Participation y Onsite materializan el release con sus propias proyecciones y eventos."
+      ]
+    }
+  ]
+}

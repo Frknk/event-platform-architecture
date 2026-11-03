@@ -205,10 +205,14 @@ El detalle de historias, criterios de aceptación y corte MVP está en el [índi
 
 ## Recorrido integral de actores
 
-El diagrama interactivo muestra el proceso desde la publicación de la actividad hasta el certificado y, de manera opcional, la emisión de una credencial en HukID. Incluye vistas enfocadas en eventos/congresos, convocatorias de emprendimiento y la integración HukID.
+Usa los diagramas detallados para revisar responsabilidades e integraciones. El resumen ejecutivo explica el recorrido de negocio; las secuencias muestran qué actor o microservicio inicia cada interacción, qué llamadas son síncronas y qué cambios se propagan por eventos.
 
-- [Abrir diagrama de flujo interactivo](diagrams/event-platform-actor-journey.workflow.html)
-- [Especificación fuente de Archify](diagrams/event-platform-actor-journey.workflow.json)
+- [Secuencia detallada: publicación, participación y operación](diagrams/events-operational-interactions.sequence.html)
+- [Fuente Archify de la secuencia operacional](diagrams/events-operational-interactions.sequence.json)
+- [Secuencia detallada: certificado a credencial HukID](diagrams/certificate-to-hukid.sequence.html)
+- [Fuente Archify de la secuencia HukID](diagrams/certificate-to-hukid.sequence.json)
+- [Flujo ejecutivo de actores](diagrams/event-platform-actor-journey.workflow.html)
+- [Fuente Archify del flujo ejecutivo](diagrams/event-platform-actor-journey.workflow.json)
 
 ## Documentación del repositorio
 

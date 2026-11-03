@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "visual-check",
+  "evidenceKind": "automated-browser",
+  "status": "skipped",
+  "visualReview": "pending",
+  "artifact": {
+    "path": "/Users/juancx/Documents/Codex/Startup/planning-artifacts/replans/event-platform-5-team-microservices-2026-11-02/diagrams/certificate-to-hukid.sequence.html",
+    "sha256": "809b13c1b80c20d4ea649ea1d6ebb4e39cc73ee2f22285636e39adda1d2fb81e",
+    "bytes": 805224
+  },
+  "state": {
+    "detail": "read",
+    "motion": "still"
+  },
+  "chrome": {
+    "status": "unavailable",
+    "executable": null
+  },
+  "diagnostics": [
+    {
+      "code": "viewer/chrome-unavailable",
+      "severity": "warning",
+      "message": "Chrome or Chromium is unavailable. Set ARCHIFY_CHROME to its executable path.",
+      "subject": {
+        "artifact": "/Users/juancx/Documents/Codex/Startup/planning-artifacts/replans/event-platform-5-team-microservices-2026-11-02/diagrams/certificate-to-hukid.sequence.html"
+      },
+      "evidence": {
+        "executable": null
+      },
+      "supportedFixes": [
+        "set ARCHIFY_CHROME to a Chrome or Chromium executable and rerun visual-check"
+      ]
+    }
+  ],
+  "containment": {
+    "status": "skipped",
+    "viewports": []
+  },
+  "readability": {
+    "status": "skipped",
+    "minimumProjectedNodeTextPx": 6,
+    "viewports": []
+  },
+  "viewerChrome": {
+    "status": "skipped",
+    "viewports": []
+  },
+  "captures": {
+    "status": "skipped",
+    "screenshots": [],
+    "contactSheet": null
+  },
+  "sidecars": {
+    "receipt": "certificate-to-hukid.sequence.visual-check.json",
+    "contactSheet": "certificate-to-hukid.sequence.visual-check.html"
+  },
+  "error": "Chrome or Chromium is unavailable. Set ARCHIFY_CHROME to its executable path."
+}
