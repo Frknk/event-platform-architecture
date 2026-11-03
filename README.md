@@ -203,6 +203,13 @@ El detalle de historias, criterios de aceptación y corte MVP está en el [índi
 - **Concurrencia segura:** comandos idempotentes, ETag para edición, cupo atómico y eventos procesables más de una vez sin efectos duplicados.
 - **Evolución independiente:** HukID, pagos y capacidades adicionales se integran por contratos, no por bases compartidas.
 
+## Recorrido integral de actores
+
+El diagrama interactivo muestra el proceso desde la publicación de la actividad hasta el certificado y, de manera opcional, la emisión de una credencial en HukID. Incluye vistas enfocadas en eventos/congresos, convocatorias de emprendimiento y la integración HukID.
+
+- [Abrir diagrama de flujo interactivo](diagrams/event-platform-actor-journey.workflow.html)
+- [Especificación fuente de Archify](diagrams/event-platform-actor-journey.workflow.json)
+
 ## Documentación del repositorio
 
 ### Producto, alcance y planificación

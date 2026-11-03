@@ -1,0 +1,90 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Proceso integral de eventos, convocatorias y credenciales",
+    "quality_profile": "showcase",
+    "output": "diagrams/event-platform-actor-journey.workflow.html",
+    "views": [
+      {
+        "id": "event_journey",
+        "label": "Evento o congreso",
+        "focus": ["organizer_publish", "public_landing", "participant_apply", "participation_decision", "staff_checkin", "attendance_certificate"],
+        "note": "Inscripción, QR, check-in y certificado forman un único recorrido trazable."
+      },
+      {
+        "id": "venture_journey",
+        "label": "Convocatoria de emprendimiento",
+        "focus": ["public_landing", "participant_apply", "participation_decision"],
+        "note": "El líder añade equipo, anexos y una revisión evaluable antes de la decisión."
+      },
+      {
+        "id": "hukid_optional",
+        "label": "Credencial HukID opcional",
+        "focus": ["attendance_certificate", "hukid_issuer", "holder_wallet"],
+        "note": "Sólo con elegibilidad y consentimiento, Events solicita una credencial a HukID por HTTPS."
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "institution", "label": "Institución y organizador" },
+    { "id": "participant", "label": "Participante o líder de emprendimiento" },
+    { "id": "platform", "label": "Plataforma de eventos y convocatorias" },
+    { "id": "staff", "label": "Staff de check-in" },
+    { "id": "hukid", "label": "HukID — producto independiente", "variant": "exception" },
+    { "id": "holder", "label": "Titular de la credencial" }
+  ],
+  "phases": [
+    { "id": "publish", "label": "1. Publicar", "fromCol": 0, "toCol": 1 },
+    { "id": "apply", "label": "2. Inscribirse o postular", "fromCol": 2, "toCol": 2, "variant": "emphasis" },
+    { "id": "confirm", "label": "3. Confirmar", "fromCol": 3, "toCol": 3, "variant": "security" },
+    { "id": "operate", "label": "4. Asistir y acreditar", "fromCol": 4, "toCol": 4, "variant": "emphasis" },
+    { "id": "credential", "label": "5. Credencial opcional", "fromCol": 5, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["organizer_publish", "public_landing", "participant_apply", "participation_decision", "staff_checkin", "attendance_certificate"],
+  "semanticChecks": {
+    "allowedRoots": ["organizer_publish"],
+    "allowedTerminals": ["attendance_certificate", "holder_wallet"],
+    "requiredPaths": [
+      { "from": "organizer_publish", "to": "attendance_certificate" },
+      { "from": "attendance_certificate", "to": "holder_wallet" }
+    ]
+  },
+  "nodes": [
+    { "id": "organizer_publish", "lane": "institution", "col": 0, "type": "frontend", "label": "Publica actividad", "sublabel": "Agenda, cupo y formulario", "width": 146 },
+    { "id": "public_landing", "lane": "platform", "col": 1, "type": "cloud", "label": "Landing pública", "sublabel": "CMS y CDN", "width": 126 },
+    { "id": "participant_apply", "lane": "participant", "col": 2, "type": "frontend", "label": "Se registra o postula", "sublabel": "Equipo y anexos si aplica", "width": 154 },
+    { "id": "participation_decision", "lane": "platform", "col": 3, "type": "backend", "label": "Participation decide", "sublabel": "Cupo, waitlist, admisión y QR", "width": 158 },
+    { "id": "staff_checkin", "lane": "staff", "col": 4, "type": "frontend", "label": "Staff valida QR", "sublabel": "PWA o búsqueda manual", "width": 142 },
+    { "id": "attendance_certificate", "lane": "platform", "col": 4, "type": "database", "label": "Asistencia y certificado", "sublabel": "Hecho trazable y PDF elegible", "width": 166 },
+    { "id": "hukid_issuer", "lane": "hukid", "col": 5, "type": "external", "label": "HukID crea oferta", "sublabel": "Issuer y API separados", "width": 146 },
+    { "id": "holder_wallet", "lane": "holder", "col": 5, "type": "frontend", "label": "Wallet del titular", "sublabel": "Acepta la credencial", "width": 140 }
+  ],
+  "edges": [
+    { "id": "publish_activity", "from": "organizer_publish", "to": "public_landing", "label": "publica release", "variant": "emphasis", "role": "main" },
+    { "id": "start_application", "from": "public_landing", "to": "participant_apply", "label": "abre inscripción o postulación", "variant": "emphasis", "role": "main" },
+    { "id": "submit_application", "from": "participant_apply", "to": "participation_decision", "label": "envía consentimiento y datos", "variant": "emphasis", "role": "main" },
+    { "id": "present_qr", "from": "participation_decision", "to": "staff_checkin", "label": "confirmación y QR", "variant": "emphasis", "role": "main" },
+    { "id": "record_attendance", "from": "staff_checkin", "to": "attendance_certificate", "label": "registra asistencia", "variant": "emphasis", "role": "main" },
+    { "id": "request_credential", "from": "attendance_certificate", "to": "hukid_issuer", "label": "consentimiento: HTTPS/OAuth2", "variant": "security", "role": "branch" },
+    { "id": "accept_credential", "from": "hukid_issuer", "to": "holder_wallet", "label": "oferta verificable", "variant": "dashed", "role": "return" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Participación individual y por emprendimiento",
+      "items": [
+        "El registro individual gestiona cupo, waitlist, confirmación y QR.",
+        "La convocatoria añade integrantes, anexos y una revisión evaluable sin cambiar el núcleo operativo."
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Límite de HukID",
+      "items": [
+        "El certificado PDF existe antes y sin depender de HukID.",
+        "HukID recibe una solicitud idempotente; no accede a la base ni al bus de Events."
+      ]
+    }
+  ]
+}
