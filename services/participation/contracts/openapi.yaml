@@ -1,0 +1,691 @@
+openapi: 3.1.0
+info:
+  title: Participation API — Event Platform Architecture (Team 3)
+  version: 1.0.0
+  description: |
+    API canónica del **Equipo 3 — Participation**.
+    Gestiona formularios públicos materializados, inscripciones concurrentes con control atómico de cupos,
+    lista de espera (waitlist) con promoción automática, emisión/revocación de tickets QR firmados (JWS asimétrico sin PII),
+    postulaciones de emprendimientos/equipos, adjuntos y backoffice con privacidad por diseño (PII cifrada AES-GCM + blind index HMAC).
+servers:
+  - url: http://localhost:8000
+    description: Local Development Server
+
+tags:
+  - name: Public Registration (PA-A)
+    description: Carga de formulario vigente, registro público con Idempotency-Key y solicitud de acceso por enlace firmado.
+  - name: Participant Self-Service (PA-A / PA-B)
+    description: Consulta de estado, edición permitida, descarga de Ticket QR JWS (`no-store`) y cancelación con promoción automática de waitlist.
+  - name: Ventures & Applications (PA-C)
+    description: Postulación de emprendimientos, invitación de integrantes, carga de archivos y envíos versionados.
+  - name: Backoffice & Admissibility (PA-D)
+    description: Búsqueda con paginación cursor y HMAC, confirmación/rechazo manual, importación y admisibilidad.
+  - name: Security & Operations (PA-E)
+    description: JWKS público para validación criptográfica Onsite, reconciliación de releases/outbox y simulación de carga.
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token OIDC / Gateway con claims firmados (`organization_id`, `sub`, `roles`, `scopes`, `aud`).
+    ParticipantAccessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWS
+      description: Token o sesión de propósito único ligado a `registration_id`, `action` y TTL máximo de 30 minutos.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+      description: Clave obligatoria en comandos POST. Misma clave + mismo request hash reproduce respuesta; distinto hash devuelve `409 idempotency_key_reused`.
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Revisión esperada (ETag). Si no coincide devuelve `412 stale_revision`.
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ProblemDetails:
+      type: object
+      required: [type, title, status, code, detail, request_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          examples: ["https://errors.example.pe/already-registered"]
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          enum:
+            - invalid_state_transition
+            - stale_revision
+            - tenant_forbidden
+            - publication_incomplete
+            - release_gap
+            - binding_not_open
+            - form_version_mismatch
+            - consent_version_mismatch
+            - already_registered
+            - capacity_exhausted
+            - waitlisted
+            - invitation_expired
+            - leader_required
+            - application_closed
+            - file_not_ready
+            - file_quarantined
+            - ticket_invalid
+            - ticket_revoked
+            - ticket_expired
+            - idempotency_key_reused
+            - validation_error
+        detail:
+          type: string
+        request_id:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              pointer:
+                type: string
+              code:
+                type: string
+              message:
+                type: string
+
+    PublicFormResponse:
+      type: object
+      required:
+        - site_slug
+        - event_slug
+        - event_id
+        - organization_id
+        - publication_id
+        - form_version_id
+        - consent_version
+        - schema_hash
+        - binding_state
+        - capacity_summary
+        - schema
+        - ui_schema
+        - consent_text
+      properties:
+        site_slug:
+          type: string
+        event_slug:
+          type: string
+        event_id:
+          type: string
+          format: uuid
+        event_title:
+          type: string
+        organization_id:
+          type: string
+          format: uuid
+        publication_id:
+          type: string
+          format: uuid
+        form_version_id:
+          type: string
+          format: uuid
+        consent_version:
+          type: string
+        schema_hash:
+          type: string
+        binding_state:
+          type: string
+          enum: [scheduled, open, closed, cancelled]
+        capacity_summary:
+          type: object
+          properties:
+            capacity:
+              type: integer
+            confirmed_count:
+              type: integer
+            remaining:
+              type: integer
+            waitlist_enabled:
+              type: boolean
+            waitlist_count:
+              type: integer
+            public_state:
+              type: string
+              enum: [available, limited, waitlist_only, closed]
+        schema:
+          type: object
+        ui_schema:
+          type: object
+        consent_text:
+          type: string
+
+    AttendeeInput:
+      type: object
+      required: [full_name, email]
+      properties:
+        full_name:
+          type: string
+          minLength: 2
+          maxLength: 160
+        email:
+          type: string
+          format: email
+        document_number:
+          type: string
+        phone:
+          type: string
+        institution:
+          type: string
+
+    RegistrationCreate:
+      type: object
+      required: [form_version_id, consent_version, consent_accepted, attendee, answers]
+      properties:
+        form_version_id:
+          type: string
+          format: uuid
+        consent_version:
+          type: string
+        consent_accepted:
+          type: boolean
+        attendee:
+          $ref: "#/components/schemas/AttendeeInput"
+        answers:
+          type: object
+          additionalProperties: true
+
+    RegistrationReceipt:
+      type: object
+      required:
+        - id
+        - organization_id
+        - event_id
+        - state
+        - revision
+        - created_at
+        - updated_at
+        - self_access_token
+      properties:
+        id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [pending_verification, pending_review, waitlisted, confirmed, rejected, cancelled]
+        waitlist_position:
+          type: [integer, "null"]
+        ticket_id:
+          type: [string, "null"]
+        revision:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        self_access_token:
+          type: string
+          description: Token firmado de propósito único (`registration:self`) para consultar estado, ticket o cancelar.
+
+    TicketResponse:
+      type: object
+      required:
+        - id
+        - registration_id
+        - event_id
+        - organization_id
+        - state
+        - version
+        - key_id
+        - audience
+        - scope
+        - jti
+        - ticket_jws
+        - issued_at
+        - expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        registration_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+          format: uuid
+        organization_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [active, revoked, expired, replaced]
+        version:
+          type: integer
+        key_id:
+          type: string
+        audience:
+          type: string
+          enum: [onsite]
+        scope:
+          type: string
+        jti:
+          type: string
+        ticket_jws:
+          type: string
+          description: Compact JWS firmado asimétricamente (ES256). No contiene PII.
+        decoded_claims:
+          type: object
+          description: Claims internos del JWS expuestos para verificación transparente (sin PII).
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+
+    ApplicationCreate:
+      type: object
+      required: [form_version_id, consent_version, venture_name, track, leader, answers]
+      properties:
+        form_version_id:
+          type: string
+          format: uuid
+        consent_version:
+          type: string
+        venture_name:
+          type: string
+        track:
+          type: string
+        leader:
+          $ref: "#/components/schemas/AttendeeInput"
+        members:
+          type: array
+          items:
+            type: object
+            required: [email, role]
+            properties:
+              email:
+                type: string
+                format: email
+              role:
+                type: string
+        answers:
+          type: object
+
+paths:
+  /participation/public/v1/sites/{site}/events/{event}/form:
+    get:
+      tags: [Public Registration (PA-A)]
+      summary: PA-001 — Cargar el formulario vigente y disponibilidad del evento
+      parameters:
+        - name: site
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: event
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: purpose
+          in: query
+          required: false
+          schema:
+            type: string
+            default: registration
+            enum: [registration, application]
+      responses:
+        "200":
+          description: Binding activo, JSON Schema, consentimiento y resumen de cupos.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicFormResponse"
+        "404":
+          description: Sitio/evento o release publicada no encontrada.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /participation/public/v1/sites/{site}/events/{event}/registrations:
+    post:
+      tags: [Public Registration (PA-A)]
+      summary: PA-002 / PA-011 / PA-012 — Registrar participante con control atómico de cupo y waitlist
+      parameters:
+        - name: site
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: event
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/XRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegistrationCreate"
+      responses:
+        "201":
+          description: Registro creado (`confirmed`, `waitlisted`, `pending_review` o `pending_verification`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationReceipt"
+        "409":
+          description: Duplicado detectado por HMAC (`already_registered`), clave de idempotencia reutilizada (`idempotency_key_reused`) o cupo agotado sin waitlist (`capacity_exhausted`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /participation/public/v1/registration-access:
+    post:
+      tags: [Public Registration (PA-A)]
+      summary: PA-006 — Solicitar enlace firmado de acceso sin enumeración
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, event_id]
+              properties:
+                email:
+                  type: string
+                  format: email
+                event_id:
+                  type: string
+                  format: uuid
+      responses:
+        "202":
+          description: Respuesta neutral que evita enumeración de correos registrados.
+
+  /participation/self/v1/registrations/{id}:
+    get:
+      tags: [Participant Self-Service (PA-A / PA-B)]
+      summary: PA-006 — Consultar estado del propio registro mediante sesión o enlace firmado
+      security:
+        - ParticipantAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Estado actual del registro, posición en waitlist y metadatos.
+    patch:
+      tags: [Participant Self-Service (PA-A / PA-B)]
+      summary: Editar campos permitidos del propio registro con control optimista ETag
+      security:
+        - ParticipantAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Registro actualizado.
+        "412":
+          description: Revisión obsoleta (`stale_revision`).
+
+  /participation/self/v1/registrations/{id}/cancellations:
+    post:
+      tags: [Participant Self-Service (PA-A / PA-B)]
+      summary: PA-007 / PA-013 — Cancelar registro, revocar ticket y promover automáticamente el siguiente en waitlist
+      security:
+        - ParticipantAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Registro cancelado idempotentemente; si liberó cupo, promueve atómicamente al primer elegible de la waitlist.
+
+  /participation/self/v1/registrations/{id}/ticket:
+    get:
+      tags: [Participant Self-Service (PA-A / PA-B)]
+      summary: PA-008 / PA-015 — Obtener Ticket QR JWS sin PII (`Cache-Control: no-store`)
+      security:
+        - ParticipantAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Ticket QR activo o revocado con firma JWS asimétrica.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TicketResponse"
+
+  /participation/v1/events/{id}/registrations:
+    get:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-030 — Listar y buscar registros por estado o blind index HMAC con enmascaramiento de PII por rol
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: email
+          in: query
+          description: Se transforma server-side a `email_hmac` para búsqueda exacta sin índice en texto plano.
+          schema:
+            type: string
+        - name: reveal_pii
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Página de registros con cursor opaco.
+
+  /participation/v1/registrations/{id}/confirmations:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-014 — Confirmar manualmente un registro sujeto a aprobación respetando el cupo atómico
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Registro confirmado y ticket emitido.
+
+  /participation/v1/registrations/{id}/rejections:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-014 — Rechazar un registro pendiente con razón allowlisted
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason_code]
+              properties:
+                reason_code:
+                  type: string
+      responses:
+        "200":
+          description: Registro rechazado.
+
+  /participation/public/v1/sites/{site}/events/{event}/applications:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-020 / PA-021 — Crear emprendimiento y postulación draft con invitaciones de equipo
+      parameters:
+        - name: site
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: event
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplicationCreate"
+      responses:
+        "201":
+          description: Emprendimiento y postulación draft creados.
+
+  /participation/self/v1/applications/{id}/submissions:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-025 — Enviar postulación generando revisión inmutable y hash de snapshot
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision]
+              properties:
+                expected_revision:
+                  type: integer
+      responses:
+        "200":
+          description: Postulación enviada (`submitted`) y evento emitido en outbox.
+
+  /.well-known/jwks.json:
+    get:
+      tags: [Security & Operations (PA-E)]
+      summary: PA-015 — Conjunto de claves públicas (JWKS) y lista firmada de revocaciones para Onsite Operations
+      responses:
+        "200":
+          description: JWKS con clave pública ECDSA P-256 (`ES256`) activa.

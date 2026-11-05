@@ -1,0 +1,17 @@
+services:
+  participation-db:
+    image: postgres:16-alpine
+    container_name: participation-postgres
+    environment:
+      POSTGRES_USER: participation_app
+      POSTGRES_PASSWORD: participation_local_secret
+      POSTGRES_DB: participation_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./services/participation/migrations/001_initial_participation_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U participation_app -d participation_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

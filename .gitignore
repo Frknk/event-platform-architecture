@@ -5,3 +5,37 @@
 # Local editor and OS metadata
 .idea/
 .vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv
+venv/
+ENV/
+.pytest_cache/
+
+# Node / Web
+node_modules/
+.npm
+apps/*/dist/
+apps/*/.vite/
+

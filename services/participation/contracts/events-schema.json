@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.example.pe/participation/events-envelope.v1.json",
+  "title": "Participation Domain Event Envelope v1",
+  "description": "Envelope canónico v1 para todos los eventos producidos y consumidos por el Equipo 3 (Participation). Prohíbe estrictamente PII en texto plano.",
+  "type": "object",
+  "required": [
+    "message_id",
+    "domain_event_id",
+    "topic",
+    "schema_version",
+    "producer",
+    "organization_id",
+    "business_event_id",
+    "occurred_at",
+    "published_at",
+    "actor",
+    "traceparent",
+    "correlation_id",
+    "causation_id",
+    "aggregate",
+    "partition_key",
+    "data"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUIDv7 que identifica una publicación individual (cambia en replay)."
+    },
+    "domain_event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUIDv7 que identifica el hecho de dominio y permanece estable al republicar."
+    },
+    "topic": {
+      "type": "string",
+      "enum": [
+        "configuration.event.release_published.v1",
+        "configuration.event.cancelled.v1",
+        "participation.registration.created.v1",
+        "participation.registration.confirmed.v1",
+        "participation.registration.waitlisted.v1",
+        "participation.registration.promoted.v1",
+        "participation.registration.rejected.v1",
+        "participation.registration.cancelled.v1",
+        "participation.ticket.issued.v1",
+        "participation.ticket.revoked.v1",
+        "participation.availability.changed.v1",
+        "participation.team_invitation.changed.v1",
+        "participation.application.submitted.v1",
+        "participation.application.status_changed.v1",
+        "participation.file.scan_completed.v1",
+        "participation.certificate_subject.available.v1"
+      ]
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "producer": {
+      "type": "string",
+      "enum": ["participation", "configuration"]
+    },
+    "organization_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "business_event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "published_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "actor": {
+      "type": "object",
+      "required": ["type", "id"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["user", "service", "system"]
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    "traceparent": {
+      "type": "string"
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "causation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "aggregate": {
+      "type": "object",
+      "required": ["type", "id", "version"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "registration",
+            "ticket",
+            "availability",
+            "application",
+            "team_invitation",
+            "release_projection"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "partition_key": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F-]+:[0-9a-fA-F-]+$",
+      "description": "Formato canónico organization_id:business_event_id"
+    },
+    "data": {
+      "type": "object",
+      "description": "Payload específico del evento libre de PII (prohibido incluir email, nombre, DNI, teléfono o respuestas en texto plano)."
+    }
+  },
+  "$defs": {
+    "RegistrationConfirmedData": {
+      "type": "object",
+      "required": ["registration_id", "event_id", "ticket_id", "ticket_version", "confirmed_at"],
+      "properties": {
+        "registration_id": { "type": "string", "format": "uuid" },
+        "event_id": { "type": "string", "format": "uuid" },
+        "ticket_id": { "type": "string", "format": "uuid" },
+        "ticket_version": { "type": "integer" },
+        "confirmed_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "RegistrationWaitlistedData": {
+      "type": "object",
+      "required": ["registration_id", "event_id", "position", "policy_version"],
+      "properties": {
+        "registration_id": { "type": "string", "format": "uuid" },
+        "event_id": { "type": "string", "format": "uuid" },
+        "position": { "type": "integer", "minimum": 1 },
+        "policy_version": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "RegistrationPromotedData": {
+      "type": "object",
+      "required": ["registration_id", "prior_state", "ticket_id", "ticket_version", "promoted_at"],
+      "properties": {
+        "registration_id": { "type": "string", "format": "uuid" },
+        "prior_state": { "type": "string", "const": "waitlisted" },
+        "ticket_id": { "type": "string", "format": "uuid" },
+        "ticket_version": { "type": "integer" },
+        "promoted_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "TicketIssuedData": {
+      "type": "object",
+      "required": ["ticket_id", "registration_id", "event_id", "scope", "version", "key_id", "expires_at"],
+      "properties": {
+        "ticket_id": { "type": "string", "format": "uuid" },
+        "registration_id": { "type": "string", "format": "uuid" },
+        "event_id": { "type": "string", "format": "uuid" },
+        "scope": { "type": "string" },
+        "version": { "type": "integer" },
+        "key_id": { "type": "string" },
+        "expires_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "TicketRevokedData": {
+      "type": "object",
+      "required": ["ticket_id", "event_id", "version", "reason_code", "revoked_at"],
+      "properties": {
+        "ticket_id": { "type": "string", "format": "uuid" },
+        "event_id": { "type": "string", "format": "uuid" },
+        "version": { "type": "integer" },
+        "reason_code": { "type": "string" },
+        "revoked_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "AvailabilityChangedData": {
+      "type": "object",
+      "required": ["event_id", "public_state", "remaining", "capacity", "waitlist_count", "as_of"],
+      "properties": {
+        "event_id": { "type": "string", "format": "uuid" },
+        "public_state": { "type": "string", "enum": ["available", "limited", "waitlist_only", "closed"] },
+        "remaining": { "type": "integer", "minimum": 0 },
+        "capacity": { "type": "integer", "minimum": 1 },
+        "waitlist_count": { "type": "integer", "minimum": 0 },
+        "as_of": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    }
+  }
+}
