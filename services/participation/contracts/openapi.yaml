@@ -519,7 +519,7 @@ paths:
   /participation/self/v1/registrations/{id}/ticket:
     get:
       tags: [Participant Self-Service (PA-A / PA-B)]
-      summary: PA-008 / PA-015 — Obtener Ticket QR JWS sin PII (`Cache-Control: no-store`)
+      summary: "PA-008 / PA-015 — Obtener Ticket QR JWS sin PII (`Cache-Control: no-store`)"
       security:
         - ParticipantAccessToken: []
       parameters:
