@@ -6,7 +6,12 @@ echo "=================================================================="
 echo " Iniciando Avance Equipo 3 — Participation (FastAPI + React)"
 echo "=================================================================="
 
+# 0. Asegurar PostgreSQL en Docker (puerto 5434)
+echo "-> Verificando contenedor PostgreSQL (Docker Compose)..."
+docker compose up -d participation-db
+
 # 1. Levantar Backend FastAPI en puerto 8000
+DATABASE_URL="${DATABASE_URL:-postgresql://participation_app:participation_local_secret@127.0.0.1:5434/participation_db}" \
 PYTHONPATH="$ROOT_DIR/services/participation" \
   "$ROOT_DIR/services/participation/.venv/bin/uvicorn" app.main:app \
   --host 0.0.0.0 --port 8000 &

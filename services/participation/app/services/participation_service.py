@@ -254,7 +254,7 @@ class ParticipationService:
             )
 
             new_capacity = int(data.get("capacity", 5))
-            waitlist_enabled = 1 if data.get("waitlist_enabled", True) else 0
+            waitlist_enabled = bool(data.get("waitlist_enabled", True))
 
             cur.execute(
                 "SELECT confirmed_count FROM capacity_counters WHERE event_id = ?",
