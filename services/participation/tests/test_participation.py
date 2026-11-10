@@ -16,6 +16,7 @@ from app.db.database import (
     DEFAULT_EVENT_ID,
     DEFAULT_EVENT_SLUG,
     DEFAULT_FORM_VERSION_ID,
+    DEFAULT_ORG_ID,
     DEFAULT_SITE_SLUG,
 )
 from app.main import create_app
@@ -736,7 +737,8 @@ def test_pa033_batch_registration_import_dry_run_and_errors():
     dry_data = dry_res.json()
     assert dry_data["dry_run"] is True
     assert dry_data["total_rows"] == 2
-    assert dry_data["created_count"] == 1
+    assert dry_data["valid_count"] == 1
+    assert dry_data["created_count"] == 0
     assert dry_data["error_count"] == 1
 
     # Database still has 0 registrations from import
@@ -850,3 +852,204 @@ def test_pa035_purpose_bound_aes_gcm_operations_projection():
     assert "retention_until" in env
     # Verify no plaintext PII exposed in the unencrypted outer projection
     assert "pedro.ops@unas.edu.pe" not in json.dumps(proj_data)
+
+
+# ---------------------------------------------------------------------------
+# Corrections from review: PostgreSQL parity, capacity race, demo reset,
+# erasure completeness and idempotent commands.
+# ---------------------------------------------------------------------------
+def test_pa024_demo_reset_after_file_upload():
+    client = _make_client()
+    payload = _sample_venture_payload(leader_email="lider.reset@unas.edu.pe")
+    created = client.post(
+        f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
+        json=payload,
+        headers={"Idempotency-Key": f"v-reset-{generate_uuidv7()}"},
+    )
+    assert created.status_code == 201
+    app_id = created.json()["application_id"]
+
+    upload = client.post(
+        f"/participation/self/v1/applications/{app_id}/file-uploads",
+        json={"field_name": "pitch", "file_name": "pitch.pdf", "size_bytes": 1024},
+    )
+    assert upload.status_code == 201
+
+    reset = client.post("/participation/v1/demo/reset", json={"capacity": 5})
+    assert reset.status_code == 200
+
+    apps = client.get(f"/participation/v1/events/{DEFAULT_EVENT_ID}/applications").json()["items"]
+    assert apps == []
+
+
+def test_pa034_erasure_scrubs_answers_and_persists_legal_hold():
+    client = _make_client()
+    db = client.app.state.db
+    email = "borrar.pii@unas.edu.pe"
+    email_hmac = security_manager.compute_email_hmac(DEFAULT_ORG_ID, email)
+
+    reg = client.post(
+        f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/registrations",
+        json=_sample_registration_payload(email=email, name="Titular Borrar"),
+        headers={"Idempotency-Key": f"erase-{generate_uuidv7()}"},
+    ).json()
+
+    legal_hold = client.post(
+        "/participation/v1/privacy-requests",
+        json={"email": email, "request_type": "erasure", "legal_hold": True},
+    )
+    assert legal_hold.status_code == 409
+
+    # The rejection is evidence and must survive the transaction rollback
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT state, legal_hold FROM privacy_requests WHERE email_hmac = ?",
+            (email_hmac,),
+        )
+        rejected = cur.fetchone()
+    assert rejected is not None
+    assert rejected["state"] == "rejected"
+    assert int(rejected["legal_hold"]) == 1
+
+    erased = client.post(
+        "/participation/v1/privacy-requests",
+        json={"email": email, "request_type": "erasure"},
+    )
+    assert erased.status_code == 200
+
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS cnt FROM registration_answers WHERE registration_id = ?",
+            (reg["id"],),
+        )
+        assert cur.fetchone()["cnt"] == 0
+        cur.execute(
+            "SELECT count(*) AS cnt FROM privacy_requests WHERE request_type = 'erasure' AND state = 'completed'"
+        )
+        assert cur.fetchone()["cnt"] == 1
+
+
+def test_pa034_rectification_is_recorded_as_rectification():
+    client = _make_client()
+    db = client.app.state.db
+    email = "rectificar@unas.edu.pe"
+    email_hmac = security_manager.compute_email_hmac(DEFAULT_ORG_ID, email)
+
+    res = client.post(
+        "/participation/v1/privacy-requests",
+        json={"email": email, "request_type": "rectification"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["request_type"] == "rectification"
+    assert body["registrations_count"] == 0
+
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT request_type, state FROM privacy_requests WHERE email_hmac = ?",
+            (email_hmac,),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    assert row["request_type"] == "rectification"
+    assert row["state"] == "completed"
+
+
+def test_pa033_import_respects_atomic_capacity_guard():
+    client = _make_client()
+    client.post("/participation/v1/demo/reset", json={"capacity": 5})
+
+    def _rows(prefix: str, count: int):
+        return [
+            {"full_name": f"{prefix} {i}", "email": f"{prefix}{i}@unas.edu.pe"}
+            for i in range(count)
+        ]
+
+    first = client.post(
+        f"/participation/v1/events/{DEFAULT_EVENT_ID}/registration-imports",
+        json={"rows": _rows("cap-a-", 4), "legal_basis": "consentimiento demo"},
+    )
+    assert first.status_code == 200
+    assert first.json()["imported_count"] == 4
+
+    second = client.post(
+        f"/participation/v1/events/{DEFAULT_EVENT_ID}/registration-imports",
+        json={"rows": _rows("cap-b-", 2), "legal_basis": "consentimiento demo"},
+    )
+    assert second.status_code == 409
+    assert second.json()["code"] == "capacity_exceeded"
+
+    registrations = client.get(
+        f"/participation/v1/events/{DEFAULT_EVENT_ID}/registrations",
+        params={"limit": 100},
+    ).json()["items"]
+    assert len(registrations) == 4
+    form = client.get(
+        f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/form"
+    ).json()
+    assert form["capacity_summary"]["confirmed_count"] == 4
+
+
+def test_pa025_submit_is_idempotent_and_listing_hides_ciphertext():
+    client = _make_client()
+    payload = _sample_venture_payload(leader_email="lider.idem@unas.edu.pe")
+    created = client.post(
+        f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
+        json=payload,
+        headers={"Idempotency-Key": f"v-idem-{generate_uuidv7()}"},
+    )
+    app_id = created.json()["application_id"]
+
+    apps = client.get(f"/participation/v1/events/{DEFAULT_EVENT_ID}/applications").json()["items"]
+    assert any(a["id"] == app_id for a in apps)
+    assert all("draft_answers_ciphertext" not in a for a in apps)
+
+    key = f"submit-idem-{generate_uuidv7()}"
+    first = client.post(
+        f"/participation/self/v1/applications/{app_id}/submissions",
+        json={"expected_revision": 1},
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 200
+    second = client.post(
+        f"/participation/self/v1/applications/{app_id}/submissions",
+        json={"expected_revision": 1},
+        headers={"Idempotency-Key": key},
+    )
+    assert second.status_code == 200
+    assert second.json()["snapshot_hash"] == first.json()["snapshot_hash"]
+    assert second.json()["revision"] == first.json()["revision"]
+
+    db = client.app.state.db
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT count(*) AS cnt FROM application_revisions WHERE application_id = ?",
+            (app_id,),
+        )
+        assert cur.fetchone()["cnt"] == 1
+
+
+def test_pa021_invitation_is_idempotent_with_same_key():
+    client = _make_client()
+    payload = _sample_venture_payload(leader_email="lider.inv.idem@unas.edu.pe")
+    venture = client.post(
+        f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
+        json=payload,
+        headers={"Idempotency-Key": f"v-inv-idem-{generate_uuidv7()}"},
+    ).json()
+
+    key = f"inv-idem-{generate_uuidv7()}"
+    body = {"email": "idem.member@unas.edu.pe", "role": "member"}
+    first = client.post(
+        f"/participation/self/v1/ventures/{venture['venture_id']}/invitations",
+        json=body,
+        headers={"Idempotency-Key": key},
+    )
+    second = client.post(
+        f"/participation/self/v1/ventures/{venture['venture_id']}/invitations",
+        json=body,
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["invitation_id"] == first.json()["invitation_id"]

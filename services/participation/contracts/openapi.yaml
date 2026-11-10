@@ -1037,6 +1037,52 @@ paths:
         "200":
           description: Borrador actualizado.
 
+  /participation/self/v1/applications/{id}/files:
+    get:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-024 — Listar archivos adjuntos de una postulación
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Lista de archivos con estado de escaneo (uploading, scanning, ready, quarantined, deleted).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          format: uuid
+                        field_name:
+                          type: string
+                        file_name:
+                          type: string
+                        mime_type:
+                          type: string
+                        size_bytes:
+                          type: integer
+                        sha256_hash:
+                          type: string
+                        state:
+                          type: string
+                          enum: [uploading, scanning, ready, quarantined, deleted]
+                        created_at:
+                          type: string
+                        scanned_at:
+                          type: string
+                          nullable: true
+
   /participation/self/v1/applications/{id}/file-uploads:
     post:
       tags: [Ventures & Applications (PA-C)]

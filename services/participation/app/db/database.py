@@ -253,6 +253,9 @@ class ParticipationDatabase:
                     )
                     if migration_file.exists():
                         cur.execute(migration_file.read_text(encoding="utf-8"))
+            # Tables added after the initial migration must exist in already
+            # provisioned databases too (the migration file only runs once).
+            self._ensure_postgres_tenant_tables()
         else:
             with self.transaction() as cur:
                 cur.executescript(
@@ -551,6 +554,82 @@ class ParticipationDatabase:
                     """
                 )
 
+    def _ensure_postgres_tenant_tables(self) -> None:
+        """Create tables that are not part of the initial migration, idempotently.
+
+        Docker only executes ``001_initial_participation_schema.sql`` when the
+        data volume is created, so databases provisioned before PA-031/PA-034
+        would otherwise miss these tables (and their RLS policies).
+        """
+        ddl = (
+            """
+            CREATE TABLE IF NOT EXISTS application_files (
+                id uuid PRIMARY KEY,
+                organization_id uuid NOT NULL,
+                application_id uuid NOT NULL REFERENCES applications(id),
+                field_name text NOT NULL,
+                file_name text NOT NULL,
+                mime_type text NOT NULL,
+                size_bytes integer NOT NULL,
+                sha256_hash text NOT NULL,
+                state text NOT NULL CHECK (state IN ('uploading', 'scanning', 'ready', 'quarantined', 'deleted')),
+                created_at timestamptz NOT NULL,
+                scanned_at timestamptz
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS privacy_requests (
+                id uuid PRIMARY KEY,
+                organization_id uuid NOT NULL,
+                email_hmac text NOT NULL,
+                request_type text NOT NULL CHECK (request_type IN ('access', 'rectification', 'erasure')),
+                legal_hold integer NOT NULL DEFAULT 0,
+                state text NOT NULL CHECK (state IN ('pending', 'completed', 'rejected')),
+                tombstone_receipt text,
+                evidence_json jsonb,
+                created_at timestamptz NOT NULL,
+                completed_at timestamptz
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id uuid PRIMARY KEY,
+                organization_id uuid NOT NULL,
+                actor text NOT NULL,
+                action text NOT NULL,
+                target_type text NOT NULL,
+                target_id uuid NOT NULL,
+                reason text NOT NULL,
+                payload_json jsonb,
+                created_at timestamptz NOT NULL
+            );
+            """,
+        )
+        rls = """
+            DO $$
+            DECLARE
+                tbl text;
+            BEGIN
+                FOREACH tbl IN ARRAY ARRAY['application_files', 'privacy_requests', 'audit_logs']
+                LOOP
+                    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
+                    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', tbl);
+                    EXECUTE format(
+                        'DROP POLICY IF EXISTS tenant_isolation_policy ON %I;
+                         CREATE POLICY tenant_isolation_policy ON %I
+                         USING (organization_id = current_setting(''app.current_organization_id'', true)::uuid)
+                         WITH CHECK (organization_id = current_setting(''app.current_organization_id'', true)::uuid);',
+                        tbl, tbl
+                    );
+                END LOOP;
+            END
+            $$;
+        """
+        with self.transaction() as cur:
+            for statement in ddl:
+                cur.execute(statement)
+            cur.execute(rls)
+
     def seed_default_release(self, default_capacity: int = 5) -> Dict[str, Any]:
         """Ensure the default published release for IncubaUNAS 2026 exists."""
         form_schema = {
@@ -673,6 +752,7 @@ class ParticipationDatabase:
             cur.execute("DELETE FROM registration_answers")
             cur.execute("DELETE FROM consents")
             cur.execute("DELETE FROM registrations")
+            cur.execute("DELETE FROM application_files")
             cur.execute("DELETE FROM application_revisions")
             cur.execute("DELETE FROM applications")
             cur.execute("DELETE FROM team_invitations")
@@ -681,6 +761,8 @@ class ParticipationDatabase:
             cur.execute("DELETE FROM idempotency_keys")
             cur.execute("DELETE FROM inbox")
             cur.execute("DELETE FROM outbox")
+            cur.execute("DELETE FROM privacy_requests")
+            cur.execute("DELETE FROM audit_logs")
             cur.execute("DELETE FROM capacity_counters")
             cur.execute("DELETE FROM release_projections")
         self.seed_default_release(default_capacity=capacity)
