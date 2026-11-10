@@ -79,7 +79,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'public' | 'concurrency' | 'backoffice' | 'ventures'>('public');
   const [formConfig, setFormConfig] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(false);
-  const [bannerAlert, setBannerAlert] = useState<{ type: 'success' | 'warning' | 'error'; title: string; detail: string } | null>(null);
+  const [bannerAlert, setBannerAlert] = useState<{ type: 'success' | 'warning' | 'error' | 'info'; title: string; detail: string } | null>(null);
 
   // Registration Form State (PA-A)
   const [fullName, setFullName] = useState('Franklyn Huamán');
@@ -1073,6 +1073,8 @@ export default function App() {
                 ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
                 : bannerAlert.type === 'warning'
                 ? 'bg-amber-950/50 border-amber-500/40 text-amber-200'
+                : bannerAlert.type === 'info'
+                ? 'bg-sky-950/50 border-sky-500/40 text-sky-200'
                 : 'bg-red-950/50 border-red-500/40 text-red-200'
             }`}
           >
