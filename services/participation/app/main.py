@@ -59,6 +59,69 @@ class ApplicationSubmitRequest(BaseModel):
     expected_revision: int = 1
 
 
+class VentureInviteRequest(BaseModel):
+    email: str
+    role: str = "member"
+
+
+class ApplicationDraftUpdateRequest(BaseModel):
+    answers: Dict[str, Any]
+    expected_revision: int = 1
+
+
+class FileUploadRequest(BaseModel):
+    field_name: str
+    file_name: str
+    mime_type: str = "application/pdf"
+    size_bytes: int
+    sha256_hash: Optional[str] = None
+
+
+class ApplicationWithdrawalRequest(BaseModel):
+    reason: str = "applicant_withdrew"
+
+
+class ApplicationChangeRequest(BaseModel):
+    requested_changes: list[str]
+    deadline: Optional[str] = None
+    reviewer_notes: Optional[str] = None
+
+
+class ApplicationResubmitRequest(BaseModel):
+    expected_revision: int = 2
+
+
+class RegistrationCorrectionRequest(BaseModel):
+    reason: str = Field(..., min_length=3)
+    updates: Dict[str, Any]
+    actor: Optional[str] = "manager"
+
+
+class ApplicationAdmissibilityDecisionRequest(BaseModel):
+    expected_revision: int
+    reason: str = Field(..., min_length=3)
+    checklist: Optional[Dict[str, bool]] = None
+
+
+class RegistrationImportRequest(BaseModel):
+    rows: list[Dict[str, Any]]
+    legal_basis: str = Field(..., min_length=3)
+    dry_run: bool = False
+
+
+class PrivacyRequestInput(BaseModel):
+    email: str
+    request_type: str = "erasure"
+    legal_hold: bool = False
+    reason: Optional[str] = None
+
+
+class OperationsProjectionRequest(BaseModel):
+    purpose: str = "certificate_issuance"
+    recipient: str = "onsite_operations"
+    confirmed_only: bool = True
+
+
 class DemoResetRequest(BaseModel):
     capacity: int = Field(default=5, ge=1, le=500)
     waitlist_enabled: bool = True
@@ -200,6 +263,101 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             idempotency_key=idempotency_key,
         )
 
+    @app.get("/participation/self/v1/ventures/{venture_id}")
+    def get_venture(venture_id: str):
+        return service.get_venture(venture_id)
+
+    @app.post("/participation/self/v1/ventures/{venture_id}/invitations", status_code=201)
+    def invite_team_member(
+        venture_id: str,
+        body: VentureInviteRequest,
+        idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    ):
+        return service.invite_team_member(
+            venture_id=venture_id,
+            email=body.email,
+            role=body.role,
+            idempotency_key=idempotency_key,
+        )
+
+    @app.post("/participation/public/v1/team-invitations/{token}/acceptance")
+    def accept_invitation(token: str):
+        return service.accept_invitation(token=token)
+
+    @app.post("/participation/public/v1/team-invitations/{token}/declination")
+    def decline_invitation(token: str):
+        return service.decline_invitation(token=token)
+
+    @app.post("/participation/self/v1/ventures/{venture_id}/members/{member_id}/leave")
+    def leave_team_member(venture_id: str, member_id: str):
+        return service.leave_team_member(venture_id=venture_id, member_id=member_id)
+
+    @app.get("/participation/self/v1/applications/{application_id}")
+    def get_application(application_id: str, response: Response):
+        app_data = service.get_application(application_id)
+        response.headers["ETag"] = app_data["etag"]
+        return app_data
+
+    @app.patch("/participation/self/v1/applications/{application_id}")
+    def update_application_draft(
+        application_id: str,
+        body: ApplicationDraftUpdateRequest,
+        response: Response,
+        if_match: Optional[str] = Header(None, alias="If-Match"),
+    ):
+        expected_rev = body.expected_revision
+        if if_match:
+            clean_match = if_match.replace('W/"', '').replace('"', '').strip()
+            if clean_match.isdigit():
+                expected_rev = int(clean_match)
+        res = service.update_application_draft(
+            application_id=application_id,
+            answers=body.answers,
+            expected_revision=expected_rev,
+        )
+        response.headers["ETag"] = res["etag"]
+        return res
+
+    @app.post("/participation/self/v1/applications/{application_id}/file-uploads", status_code=201)
+    def upload_application_file(application_id: str, body: FileUploadRequest):
+        return service.upload_application_file(
+            application_id=application_id,
+            field_name=body.field_name,
+            file_name=body.file_name,
+            mime_type=body.mime_type,
+            size_bytes=body.size_bytes,
+            sha256_hash=body.sha256_hash,
+        )
+
+    @app.get("/participation/self/v1/applications/{application_id}/files")
+    def list_application_files(application_id: str):
+        return {"items": service.list_application_files(application_id)}
+
+    @app.post("/participation/self/v1/applications/{application_id}/withdrawals")
+    def withdraw_application(application_id: str, body: ApplicationWithdrawalRequest):
+        return service.withdraw_application(application_id=application_id, reason=body.reason)
+
+    @app.post("/participation/v1/applications/{application_id}/change-requests")
+    def request_application_changes(application_id: str, body: ApplicationChangeRequest):
+        return service.request_application_changes(
+            application_id=application_id,
+            requested_changes=body.requested_changes,
+            deadline=body.deadline,
+            reviewer_notes=body.reviewer_notes,
+        )
+
+    @app.post("/participation/self/v1/applications/{application_id}/resubmissions")
+    def resubmit_application(
+        application_id: str,
+        body: ApplicationResubmitRequest,
+        idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    ):
+        return service.resubmit_application(
+            application_id=application_id,
+            expected_revision=body.expected_revision,
+            idempotency_key=idempotency_key,
+        )
+
     # -------------------------------------------------------------------------
     # Backoffice & Security Endpoints (PA-D / PA-E)
     # -------------------------------------------------------------------------
@@ -211,6 +369,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         email: Optional[str] = Query(default=None),
         reveal_pii: bool = Query(default=False),
         limit: int = Query(default=50, ge=1, le=100),
+        cursor: Optional[str] = Query(default=None),
+        from_date: Optional[str] = Query(default=None),
+        to_date: Optional[str] = Query(default=None),
     ):
         response.headers["Cache-Control"] = "no-store"
         return service.list_event_registrations(
@@ -219,6 +380,94 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             email_query=email,
             reveal_pii=reveal_pii,
             limit=limit,
+            cursor=cursor,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
+    @app.patch("/participation/v1/registrations/{registration_id}")
+    def correct_registration_admin(
+        registration_id: str,
+        body: RegistrationCorrectionRequest,
+    ):
+        """PA-031: Manager corrects allowlisted administrative fields with audit logging."""
+        return service.correct_registration_admin(
+            registration_id=registration_id,
+            reason=body.reason,
+            updates=body.updates,
+            actor=body.actor or "manager",
+        )
+
+    @app.get("/participation/v1/events/{event_id}/applications")
+    def list_event_applications(
+        event_id: str,
+        state: Optional[str] = Query(default=None),
+    ):
+        """PA-032: Reviewer/Manager lists applications with venture info and status."""
+        return {"items": service.list_event_applications(event_id=event_id, state=state)}
+
+    @app.post("/participation/v1/applications/{application_id}/admissions")
+    def admit_application(
+        application_id: str,
+        body: ApplicationAdmissibilityDecisionRequest,
+    ):
+        """PA-032: Reviewer evaluates and admits an application with checklist and reason."""
+        return service.admit_application(
+            application_id=application_id,
+            expected_revision=body.expected_revision,
+            reason=body.reason,
+            checklist=body.checklist,
+        )
+
+    @app.post("/participation/v1/applications/{application_id}/rejections")
+    def reject_application(
+        application_id: str,
+        body: ApplicationAdmissibilityDecisionRequest,
+    ):
+        """PA-032: Reviewer evaluates and rejects an application with checklist and reason."""
+        return service.reject_application(
+            application_id=application_id,
+            expected_revision=body.expected_revision,
+            reason=body.reason,
+            checklist=body.checklist,
+        )
+
+    @app.post("/participation/v1/events/{event_id}/registration-imports")
+    def import_registrations(
+        event_id: str,
+        body: RegistrationImportRequest,
+    ):
+        """PA-033: Controlled batch registration import with dry-run and capacity enforcement."""
+        return service.import_registrations(
+            event_id=event_id,
+            rows=body.rows,
+            legal_basis=body.legal_basis,
+            dry_run=body.dry_run,
+        )
+
+    @app.post("/participation/v1/privacy-requests")
+    def execute_privacy_request(
+        body: PrivacyRequestInput,
+    ):
+        """PA-034: ARCO Privacy request with Legal Hold blocking and zero-PII receipt."""
+        return service.execute_privacy_request(
+            email=body.email,
+            request_type=body.request_type,
+            legal_hold=body.legal_hold,
+            reason=body.reason,
+        )
+
+    @app.post("/participation/v1/events/{event_id}/operations-projections")
+    def create_operations_projection(
+        event_id: str,
+        body: OperationsProjectionRequest,
+    ):
+        """PA-035: Purpose-bound operations projection with AES-GCM envelope."""
+        return service.create_operations_projection(
+            event_id=event_id,
+            purpose=body.purpose,
+            recipient=body.recipient,
+            confirmed_only=body.confirmed_only,
         )
 
     @app.get("/.well-known/jwks.json")
