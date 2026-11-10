@@ -34,6 +34,7 @@ from app.core.security import (
     security_manager,
     utc_now_iso,
 )
+from app.services.audit_service import AuditContext, AuditResult, AuditService
 from app.db.database import (
     DEFAULT_CONSENT_VERSION,
     DEFAULT_EVENT_ID,
@@ -48,8 +49,32 @@ from app.db.database import (
 class ParticipationService:
     """Core transactional engine for Team 3 — Participation."""
 
-    def __init__(self, db: ParticipationDatabase) -> None:
+    def __init__(self, db: ParticipationDatabase, audit_service: AuditService) -> None:
         self.db = db
+        self.audit_service = audit_service
+
+    def _record_audit(
+        self,
+        cur: Any,
+        *,
+        context: Optional[AuditContext],
+        organization_id: str,
+        action: str,
+        target_type: str,
+        target_id: str,
+        result: AuditResult,
+    ) -> None:
+        if context is None:
+            return
+        self.audit_service.record(
+            cur,
+            context=context,
+            organization_id=organization_id,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            result=result,
+        )
 
     # -------------------------------------------------------------------------
     # Transactional Outbox & Inbox Helpers (EVENT-CONTRACTS.md)
@@ -1313,7 +1338,7 @@ class ParticipationService:
         registration_id: str,
         reason: str,
         updates: Dict[str, Any],
-        actor: str = "manager",
+        audit_context: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
         """PA-031: Manager corrects allowlisted admin fields without altering questionnaire answers or snapshot."""
         if not reason or len(reason.strip()) < 3:
@@ -1366,25 +1391,16 @@ class ParticipationService:
                 (new_ciphertext, new_name_masked, now, registration_id),
             )
 
-            # Record audit log
-            cur.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, organization_id, actor, action, target_type, target_id, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, 'correct_registration', 'registration', ?, ?, ?, ?)
-                """,
-                (
-                    generate_uuidv7(),
-                    org_id,
-                    actor,
-                    registration_id,
-                    reason,
-                    json.dumps({"updated_fields": list(updates.keys())}, ensure_ascii=False),
-                    now,
-                ),
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="correct_registration",
+                target_type="registration",
+                target_id=registration_id,
+                result="success",
             )
 
-            # Emit audit event
             self._emit_outbox_event(
                 cur,
                 organization_id=org_id,
@@ -1397,7 +1413,11 @@ class ParticipationService:
                     "registration_id": registration_id,
                     "updated_fields": list(updates.keys()),
                     "reason": reason,
-                    "actor": actor,
+                    "actor": (
+                        audit_context.actor_id
+                        if audit_context and audit_context.actor_id
+                        else "unattributed"
+                    ),
                     "corrected_at": now,
                 },
             )
@@ -1444,7 +1464,7 @@ class ParticipationService:
         expected_revision: int,
         reason: str,
         checklist: Optional[Dict[str, bool]] = None,
-        actor: str = "reviewer",
+        audit_context: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
         """PA-032: Reviewer admits application after validating admissibility checklist."""
         with self.db.transaction() as cur:
@@ -1467,21 +1487,14 @@ class ParticipationService:
                 (new_rev, now, application_id),
             )
 
-            cur.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, organization_id, actor, action, target_type, target_id, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, 'admit_application', 'application', ?, ?, ?, ?)
-                """,
-                (
-                    generate_uuidv7(),
-                    org_id,
-                    actor,
-                    application_id,
-                    reason,
-                    json.dumps({"checklist": checklist or {}}, ensure_ascii=False),
-                    now,
-                ),
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="admit_application",
+                target_type="application",
+                target_id=application_id,
+                result="success",
             )
 
             self._emit_outbox_event(
@@ -1516,7 +1529,7 @@ class ParticipationService:
         expected_revision: int,
         reason: str,
         checklist: Optional[Dict[str, bool]] = None,
-        actor: str = "reviewer",
+        audit_context: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
         """PA-032: Reviewer rejects application with justification."""
         with self.db.transaction() as cur:
@@ -1539,21 +1552,14 @@ class ParticipationService:
                 (new_rev, now, application_id),
             )
 
-            cur.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, organization_id, actor, action, target_type, target_id, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, 'reject_application', 'application', ?, ?, ?, ?)
-                """,
-                (
-                    generate_uuidv7(),
-                    org_id,
-                    actor,
-                    application_id,
-                    reason,
-                    json.dumps({"checklist": checklist or {}}, ensure_ascii=False),
-                    now,
-                ),
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="reject_application",
+                target_type="application",
+                target_id=application_id,
+                result="success",
             )
 
             self._emit_outbox_event(
@@ -1586,6 +1592,7 @@ class ParticipationService:
         rows: List[Dict[str, Any]],
         legal_basis: str,
         dry_run: bool = False,
+        audit_context: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
         """PA-033: Controlled batch/CSV registration import with dry-run, row-level errors and explicit legal basis."""
         if not legal_basis or len(legal_basis.strip()) < 3:
@@ -1744,6 +1751,17 @@ class ParticipationService:
                 (new_confirmed, now, event_id),
             )
 
+            if imported_ids:
+                self._record_audit(
+                    cur,
+                    context=audit_context,
+                    organization_id=org_id,
+                    action="import_registrations",
+                    target_type="event",
+                    target_id=event_id,
+                    result="success",
+                )
+
             self._emit_outbox_event(
                 cur,
                 organization_id=org_id,
@@ -1776,6 +1794,7 @@ class ParticipationService:
         request_type: str,
         legal_hold: bool = False,
         reason: Optional[str] = None,
+        audit_context: Optional[AuditContext] = None,
     ) -> Dict[str, Any]:
         """PA-034: ARCO Privacy Request handler with Legal Hold protection, erasure/tombstone and zero-PII cryptographic receipt."""
         clean_email = email.strip().lower()
@@ -1886,11 +1905,29 @@ class ParticipationService:
                         "registrations_anonymized": len(reg_ids),
                     },
                 )
+                self._record_audit(
+                    cur,
+                    context=audit_context,
+                    organization_id=org_id,
+                    action="privacy_request",
+                    target_type="privacy_request",
+                    target_id=audit_context.request_id if audit_context else req_id,
+                    result="success",
+                )
                 return evidence_payload
 
             # Access request
             cur.execute("SELECT id, state, created_at, confirmed_at FROM registrations WHERE email_hmac = ?", (email_hmac,))
             regs = [dict(r) for r in cur.fetchall()]
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="privacy_request",
+                target_type="privacy_request",
+                target_id=audit_context.request_id if audit_context else req_id,
+                result="success",
+            )
             return {
                 "request_type": "access",
                 "email_masked": mask_email(clean_email),

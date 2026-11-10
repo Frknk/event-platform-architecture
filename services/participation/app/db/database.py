@@ -240,19 +240,49 @@ class ParticipationDatabase:
                 finally:
                     cursor.close()
 
+    def _migrate_audit_logs_sqlite(self) -> None:
+        with self.transaction() as cur:
+            cur.execute("PRAGMA table_info(audit_logs)")
+            columns = {row["name"] for row in cur.fetchall()}
+            if not columns:
+                raise RuntimeError("SQLite audit_logs table was not initialized.")
+
+            for column in ("actor_type", "actor_id", "result", "request_id"):
+                if column not in columns:
+                    cur.execute(f"ALTER TABLE audit_logs ADD COLUMN {column} TEXT")
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_target_created
+                ON audit_logs (organization_id, target_type, target_id, created_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_request
+                ON audit_logs (organization_id, request_id)
+                """
+            )
+
     def init_schema(self) -> None:
         if self.backend == "postgres":
             with self.transaction() as cur:
                 cur.execute("SELECT to_regclass('release_projections');")
                 res = cur.fetchone()
+                migrations_dir = (
+                    Path(__file__).resolve().parent.parent.parent / "migrations"
+                )
                 if not res or not res.get("to_regclass"):
-                    migration_file = (
-                        Path(__file__).resolve().parent.parent.parent
-                        / "migrations"
-                        / "001_initial_participation_schema.sql"
-                    )
+                    migration_file = migrations_dir / "001_initial_participation_schema.sql"
                     if migration_file.exists():
                         cur.execute(migration_file.read_text(encoding="utf-8"))
+                    else:
+                        raise FileNotFoundError(migration_file)
+
+                audit_migration = migrations_dir / "002_audit_logs_enrichment.sql"
+                if not audit_migration.exists():
+                    raise FileNotFoundError(audit_migration)
+                cur.execute(audit_migration.read_text(encoding="utf-8"))
         else:
             with self.transaction() as cur:
                 cur.executescript(
@@ -550,6 +580,7 @@ class ParticipationDatabase:
                     );
                     """
                 )
+            self._migrate_audit_logs_sqlite()
 
     def seed_default_release(self, default_capacity: int = 5) -> Dict[str, Any]:
         """Ensure the default published release for IncubaUNAS 2026 exists."""

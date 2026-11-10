@@ -6,7 +6,7 @@ Implements the canonical endpoints defined in contracts/API-CONTRACTS.md and TEA
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,13 +15,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.core.problem import ProblemException, create_problem_response
-from app.core.security import generate_uuidv7, security_manager
+from app.core.security import security_manager
 from app.db.database import (
     DEFAULT_EVENT_ID,
     DEFAULT_EVENT_SLUG,
+    DEFAULT_ORG_ID,
     DEFAULT_SITE_SLUG,
     ParticipationDatabase,
 )
+from app.services.audit_service import AuditContext, AuditService
 from app.services.participation_service import ParticipationService
 
 
@@ -94,7 +96,6 @@ class ApplicationResubmitRequest(BaseModel):
 class RegistrationCorrectionRequest(BaseModel):
     reason: str = Field(..., min_length=3)
     updates: Dict[str, Any]
-    actor: Optional[str] = "manager"
 
 
 class ApplicationAdmissibilityDecisionRequest(BaseModel):
@@ -148,15 +149,15 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     )
 
     db = ParticipationDatabase(db_path=db_path)
-    service = ParticipationService(db=db)
+    audit_service = AuditService()
+    service = ParticipationService(db=db, audit_service=audit_service)
     app.state.db = db
     app.state.service = service
+    app.state.audit_service = audit_service
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
-        incoming_req_id = request.headers.get("X-Request-Id")
-        request_id = incoming_req_id if incoming_req_id and len(incoming_req_id) >= 8 else generate_uuidv7()
-        request.state.request_id = request_id
+        request_id = audit_service.assign_request_id(request)
         response: Response = await call_next(request)
         response.headers["X-Request-Id"] = request_id
         return response
@@ -164,6 +165,30 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     @app.exception_handler(ProblemException)
     async def problem_exception_handler(request: Request, exc: ProblemException):
         return create_problem_response(request, exc)
+
+    def run_sensitive_operation(
+        request: Request,
+        *,
+        action: str,
+        target_type: str,
+        target_id: str,
+        operation: Callable[[AuditContext], Any],
+    ) -> Any:
+        context = audit_service.context_for_request(request)
+        try:
+            return operation(context)
+        except ProblemException:
+            with db.transaction() as cur:
+                audit_service.record(
+                    cur,
+                    context=context,
+                    organization_id=DEFAULT_ORG_ID,
+                    action=action,
+                    target_type=target_type,
+                    target_id=target_id,
+                    result="rejected",
+                )
+            raise
 
     # -------------------------------------------------------------------------
     # Public Endpoints (PA-A)
@@ -389,13 +414,20 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def correct_registration_admin(
         registration_id: str,
         body: RegistrationCorrectionRequest,
+        request: Request,
     ):
         """PA-031: Manager corrects allowlisted administrative fields with audit logging."""
-        return service.correct_registration_admin(
-            registration_id=registration_id,
-            reason=body.reason,
-            updates=body.updates,
-            actor=body.actor or "manager",
+        return run_sensitive_operation(
+            request,
+            action="correct_registration",
+            target_type="registration",
+            target_id=registration_id,
+            operation=lambda context: service.correct_registration_admin(
+                registration_id=registration_id,
+                reason=body.reason,
+                updates=body.updates,
+                audit_context=context,
+            ),
         )
 
     @app.get("/participation/v1/events/{event_id}/applications")
@@ -410,51 +442,83 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def admit_application(
         application_id: str,
         body: ApplicationAdmissibilityDecisionRequest,
+        request: Request,
     ):
         """PA-032: Reviewer evaluates and admits an application with checklist and reason."""
-        return service.admit_application(
-            application_id=application_id,
-            expected_revision=body.expected_revision,
-            reason=body.reason,
-            checklist=body.checklist,
+        return run_sensitive_operation(
+            request,
+            action="admit_application",
+            target_type="application",
+            target_id=application_id,
+            operation=lambda context: service.admit_application(
+                application_id=application_id,
+                expected_revision=body.expected_revision,
+                reason=body.reason,
+                checklist=body.checklist,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/applications/{application_id}/rejections")
     def reject_application(
         application_id: str,
         body: ApplicationAdmissibilityDecisionRequest,
+        request: Request,
     ):
         """PA-032: Reviewer evaluates and rejects an application with checklist and reason."""
-        return service.reject_application(
-            application_id=application_id,
-            expected_revision=body.expected_revision,
-            reason=body.reason,
-            checklist=body.checklist,
+        return run_sensitive_operation(
+            request,
+            action="reject_application",
+            target_type="application",
+            target_id=application_id,
+            operation=lambda context: service.reject_application(
+                application_id=application_id,
+                expected_revision=body.expected_revision,
+                reason=body.reason,
+                checklist=body.checklist,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/events/{event_id}/registration-imports")
     def import_registrations(
         event_id: str,
         body: RegistrationImportRequest,
+        request: Request,
     ):
         """PA-033: Controlled batch registration import with dry-run and capacity enforcement."""
-        return service.import_registrations(
-            event_id=event_id,
-            rows=body.rows,
-            legal_basis=body.legal_basis,
-            dry_run=body.dry_run,
+        return run_sensitive_operation(
+            request,
+            action="import_registrations",
+            target_type="event",
+            target_id=event_id,
+            operation=lambda context: service.import_registrations(
+                event_id=event_id,
+                rows=body.rows,
+                legal_basis=body.legal_basis,
+                dry_run=body.dry_run,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/privacy-requests")
     def execute_privacy_request(
         body: PrivacyRequestInput,
+        request: Request,
     ):
         """PA-034: ARCO Privacy request with Legal Hold blocking and zero-PII receipt."""
-        return service.execute_privacy_request(
-            email=body.email,
-            request_type=body.request_type,
-            legal_hold=body.legal_hold,
-            reason=body.reason,
+        return run_sensitive_operation(
+            request,
+            action="privacy_request",
+            target_type="privacy_request",
+            target_id=request.state.request_id,
+            operation=lambda context: service.execute_privacy_request(
+                email=body.email,
+                request_type=body.request_type,
+                legal_hold=body.legal_hold,
+                reason=body.reason,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/events/{event_id}/operations-projections")

@@ -760,7 +760,6 @@ export default function App() {
         body: JSON.stringify({
           reason: editReason.trim(),
           updates,
-          actor: 'manager',
         }),
       });
       const data = await res.json();
