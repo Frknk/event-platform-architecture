@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: participation_local_secret
       POSTGRES_DB: participation_db
     ports:
-      - "5433:5432"
+      - "${PARTICIPATION_DB_PORT:-5434}:5432"
     volumes:
       - ./services/participation/migrations/001_initial_participation_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
     healthcheck:

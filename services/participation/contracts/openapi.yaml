@@ -519,7 +519,7 @@ paths:
   /participation/self/v1/registrations/{id}/ticket:
     get:
       tags: [Participant Self-Service (PA-A / PA-B)]
-      summary: PA-008 / PA-015 — Obtener Ticket QR JWS sin PII (`Cache-Control: no-store`)
+      summary: "PA-008 / PA-015 — Obtener Ticket QR JWS sin PII (`Cache-Control: no-store`)"
       security:
         - ParticipantAccessToken: []
       parameters:
@@ -630,6 +630,226 @@ paths:
         "200":
           description: Registro rechazado.
 
+  /participation/v1/registrations/{id}:
+    patch:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-031 — Corrección administrativa de campos allowlisted con justificación auditada
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason, updates]
+              properties:
+                reason:
+                  type: string
+                  minLength: 3
+                updates:
+                  type: object
+                  description: Campos permitidos full_name, phone, institution, document_number.
+                actor:
+                  type: string
+                  default: manager
+      responses:
+        "200":
+          description: Registro corregido y evento de auditoría emitido.
+
+  /participation/v1/events/{id}/applications:
+    get:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-032 — Listar postulaciones del evento para evaluación de admisibilidad
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: state
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Lista de postulaciones con datos de emprendimiento y archivos.
+
+  /participation/v1/applications/{id}/admissions:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-032 — Admitir postulación tras validar checklist de admisibilidad con control optimista
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision, reason]
+              properties:
+                expected_revision:
+                  type: integer
+                reason:
+                  type: string
+                  minLength: 3
+                checklist:
+                  type: object
+                  additionalProperties:
+                    type: boolean
+      responses:
+        "200":
+          description: Postulación admitida.
+
+  /participation/v1/applications/{id}/rejections:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-032 — Rechazar postulación con justificación y checklist con control optimista
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision, reason]
+              properties:
+                expected_revision:
+                  type: integer
+                reason:
+                  type: string
+                  minLength: 3
+                checklist:
+                  type: object
+                  additionalProperties:
+                    type: boolean
+      responses:
+        "200":
+          description: Postulación rechazada.
+
+  /participation/v1/events/{id}/registration-imports:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-033 — Importación masiva por lotes/CSV con dry-run, desglose de errores y base legal
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rows, legal_basis]
+              properties:
+                rows:
+                  type: array
+                  items:
+                    type: object
+                legal_basis:
+                  type: string
+                dry_run:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Resultado de la importación o simulación con desglose por fila.
+
+  /participation/v1/privacy-requests:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-034 — Tramitar solicitud de derechos ARCO con bloqueo Legal Hold y recibo criptográfico sin PII
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                request_type:
+                  type: string
+                  enum: [access, rectification, erasure]
+                  default: erasure
+                legal_hold:
+                  type: boolean
+                  default: false
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Solicitud procesada y recibo emitido.
+
+  /participation/v1/events/{id}/operations-projections:
+    post:
+      tags: [Backoffice & Admissibility (PA-D)]
+      summary: PA-035 — Proyección con propósito acotado para T4 Onsite/Operaciones con sobre cifrado AES-256-GCM
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [purpose]
+              properties:
+                purpose:
+                  type: string
+                  enum: [certificate_issuance, onsite_attendance, institutional_reporting]
+                recipient:
+                  type: string
+                  default: onsite_operations
+                confirmed_only:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: Proyección cifrada con digest SHA-256 y metadatos de retención.
+
   /participation/public/v1/sites/{site}/events/{event}/applications:
     post:
       tags: [Ventures & Applications (PA-C)]
@@ -681,6 +901,256 @@ paths:
       responses:
         "200":
           description: Postulación enviada (`submitted`) y evento emitido en outbox.
+
+  /participation/self/v1/ventures/{id}:
+    get:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-020 — Obtener detalles de emprendimiento, miembros e invitaciones
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Emprendimiento y estado del equipo.
+
+  /participation/self/v1/ventures/{id}/invitations:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-021 — Invitar integrantes al equipo con rol
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                role:
+                  type: string
+                  enum: [co_founder, member]
+      responses:
+        "201":
+          description: Invitación emitida con token expirable.
+
+  /participation/public/v1/team-invitations/{token}/acceptance:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-022 — Integrante acepta invitación de equipo
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Invitación aceptada y miembro activado en el equipo.
+
+  /participation/public/v1/team-invitations/{token}/declination:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-022 — Integrante declina invitación
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Invitación declinada.
+
+  /participation/self/v1/ventures/{id}/members/{member_id}/leave:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-022 — Retiro auditado de miembro con salvaguarda de líder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: member_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Miembro retirado del equipo.
+
+  /participation/self/v1/applications/{id}:
+    get:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-023 — Obtener postulación draft con ETag
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Datos del borrador con header ETag.
+    patch:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-023 — Guardar borrador con control de concurrencia optimista (ETag)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: If-Match
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answers]
+              properties:
+                answers:
+                  type: object
+                expected_revision:
+                  type: integer
+      responses:
+        "200":
+          description: Borrador actualizado.
+
+  /participation/self/v1/applications/{id}/file-uploads:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-024 — Adjuntar archivo con verificación MIME, tamaño y escaneo de malware
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field_name, file_name, size_bytes]
+              properties:
+                field_name:
+                  type: string
+                file_name:
+                  type: string
+                mime_type:
+                  type: string
+                size_bytes:
+                  type: integer
+                sha256_hash:
+                  type: string
+      responses:
+        "201":
+          description: Archivo procesado (ready o quarantined).
+
+  /participation/self/v1/applications/{id}/withdrawals:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-026 — Retirar postulación con razón auditada
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+      responses:
+        "200":
+          description: Postulación retirada (`withdrawn`).
+
+  /participation/v1/applications/{id}/change-requests:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-027 — Organizador solicita subsanación de postulación
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requested_changes]
+              properties:
+                requested_changes:
+                  type: array
+                  items:
+                    type: string
+                deadline:
+                  type: string
+                reviewer_notes:
+                  type: string
+      responses:
+        "200":
+          description: Postulación en estado `needs_changes`.
+
+  /participation/self/v1/applications/{id}/resubmissions:
+    post:
+      tags: [Ventures & Applications (PA-C)]
+      summary: PA-027 — Reenviar postulación subsanada generando nueva revisión inmutable
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision]
+              properties:
+                expected_revision:
+                  type: integer
+      responses:
+        "200":
+          description: Postulación reenviada (`resubmitted`) con revisión número 2+.
 
   /.well-known/jwks.json:
     get:
