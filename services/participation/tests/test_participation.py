@@ -849,6 +849,9 @@ def test_pa034_privacy_arco_erasure_legal_hold_and_zero_pii_receipt():
     assert legal_hold_audit[0]["action"] == "privacy_request"
     assert legal_hold_audit[0]["result"] == "rejected"
     assert user_email not in json.dumps(legal_hold_audit)
+    with client.app.state.db.read_cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS count FROM audit_legal_hold_events")
+        assert cur.fetchone()["count"] == 0
 
     # 2. Erasure executed without Legal Hold -> Tombstone, ticket revoked, zero PII receipt
     erase_res = client.post(

@@ -172,6 +172,7 @@ class ParticipationDatabase:
             isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA recursive_triggers = ON")
 
     def _init_postgres(self) -> None:
         try:
@@ -261,6 +262,118 @@ class ParticipationDatabase:
                 """
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_request
                 ON audit_logs (organization_id, request_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_legal_hold_events (
+                    event_id TEXT PRIMARY KEY,
+                    hold_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK (event_type IN ('placed', 'released')),
+                    authority_ref_digest TEXT NOT NULL
+                        CHECK (
+                            length(authority_ref_digest) = 64
+                            AND authority_ref_digest NOT GLOB '*[^0-9a-f]*'
+                        ),
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    UNIQUE (organization_id, hold_id, event_type)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_legal_hold_target
+                ON audit_legal_hold_events (
+                    organization_id, target_type, target_id, hold_id, event_type
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_logs_no_update
+                BEFORE UPDATE ON audit_logs
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_logs is append-only');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_logs_guard_delete
+                BEFORE DELETE ON audit_logs
+                BEGIN
+                    SELECT CASE
+                        WHEN julianday(OLD.created_at) IS NULL
+                          OR julianday(OLD.created_at) > julianday('now', '-2 years')
+                        THEN RAISE(ABORT, 'audit retention period has not expired')
+                    END;
+                    SELECT CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM audit_legal_hold_events placed
+                            WHERE placed.organization_id = OLD.organization_id
+                              AND placed.target_type = OLD.target_type
+                              AND placed.target_id = OLD.target_id
+                              AND placed.event_type = 'placed'
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM audit_legal_hold_events released
+                                  WHERE released.organization_id = placed.organization_id
+                                    AND released.hold_id = placed.hold_id
+                                    AND released.event_type = 'released'
+                              )
+                        )
+                        THEN RAISE(ABORT, 'audit record is protected by legal hold')
+                    END;
+                    SELECT RAISE(ABORT, 'audit purge is disabled pending maintenance authorization');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_legal_hold_events_no_update
+                BEFORE UPDATE ON audit_legal_hold_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit legal hold events are append-only');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_legal_hold_events_no_delete
+                BEFORE DELETE ON audit_legal_hold_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit legal hold events are append-only');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_legal_hold_release_requires_active_hold
+                BEFORE INSERT ON audit_legal_hold_events
+                WHEN NEW.event_type = 'released'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM audit_legal_hold_events placed
+                      WHERE placed.organization_id = NEW.organization_id
+                        AND placed.hold_id = NEW.hold_id
+                        AND placed.target_type = NEW.target_type
+                        AND placed.target_id = NEW.target_id
+                        AND placed.event_type = 'placed'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM audit_legal_hold_events released
+                            WHERE released.organization_id = placed.organization_id
+                              AND released.hold_id = placed.hold_id
+                              AND released.event_type = 'released'
+                        )
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'cannot release an inactive audit legal hold');
+                END
                 """
             )
 
@@ -795,7 +908,6 @@ class ParticipationDatabase:
             cur.execute("DELETE FROM inbox")
             cur.execute("DELETE FROM outbox")
             cur.execute("DELETE FROM privacy_requests")
-            cur.execute("DELETE FROM audit_logs")
             cur.execute("DELETE FROM capacity_counters")
             cur.execute("DELETE FROM release_projections")
         self.seed_default_release(default_capacity=capacity)
