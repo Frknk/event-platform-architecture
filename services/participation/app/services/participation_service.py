@@ -509,15 +509,16 @@ class ParticipationService:
                 state = "pending_review"
             elif confirmed_count < capacity:
                 state = "confirmed"
-                confirmed_count += 1
                 confirmed_at = now
+                # Atomic counter update: safe under PostgreSQL READ COMMITTED
+                # (never overwrite with a stale absolute value).
                 cur.execute(
                     """
                     UPDATE capacity_counters
-                    SET confirmed_count = ?, revision = revision + 1, updated_at = ?
+                    SET confirmed_count = confirmed_count + 1, revision = revision + 1, updated_at = ?
                     WHERE event_id = ? AND confirmed_count < capacity
                     """,
-                    (confirmed_count, now, event_id),
+                    (now, event_id),
                 )
                 if cur.rowcount != 1:
                     raise ProblemException(
@@ -526,6 +527,7 @@ class ParticipationService:
                         title="Concurrent capacity exhausted",
                         detail="Capacity was reached concurrently.",
                     )
+                confirmed_count += 1
             elif waitlist_enabled:
                 state = "waitlisted"
                 waitlist_position = next_waitlist_seq
@@ -1272,8 +1274,13 @@ class ParticipationService:
                 params.append(to_date)
 
             if cursor:
-                query += " AND r.created_at > ?"
-                params.append(cursor)
+                if "|" in cursor:
+                    cursor_created_at, cursor_id = cursor.split("|", 1)
+                    query += " AND (r.created_at > ? OR (r.created_at = ? AND r.id > ?))"
+                    params.extend([cursor_created_at, cursor_created_at, cursor_id])
+                else:
+                    query += " AND r.created_at > ?"
+                    params.append(cursor)
 
             query += " ORDER BY r.created_at ASC LIMIT ?"
             fetch_limit = min(100, max(1, limit))
@@ -1329,7 +1336,11 @@ class ParticipationService:
                     }
                 )
 
-            next_cursor = items[-1]["created_at"] if len(items) == fetch_limit else None
+            next_cursor = (
+                f"{items[-1]['created_at']}|{items[-1]['id']}"
+                if len(items) == fetch_limit
+                else None
+            )
             return {"items": items, "next_cursor": next_cursor}
 
     def correct_registration_admin(
@@ -1385,7 +1396,7 @@ class ParticipationService:
             cur.execute(
                 """
                 UPDATE registrations
-                SET pii_ciphertext = ?, full_name_masked = ?, updated_at = ?
+                SET pii_ciphertext = ?, full_name_masked = ?, revision = revision + 1, updated_at = ?
                 WHERE id = ?
                 """,
                 (new_ciphertext, new_name_masked, now, registration_id),
@@ -1440,7 +1451,11 @@ class ParticipationService:
         """PA-032: List venture applications for reviewer/manager admissibility evaluation."""
         with self.db.read_cursor() as cur:
             query = """
-                SELECT a.*, v.name AS venture_name, v.track AS venture_track,
+                SELECT a.id, a.organization_id, a.event_id, a.venture_id,
+                       a.form_version_id, a.state, a.current_revision_number,
+                       a.revision, a.snapshot_hash, a.created_at, a.updated_at,
+                       a.submitted_at,
+                       v.name AS venture_name, v.track AS venture_track,
                        (SELECT count(*) FROM application_files f WHERE f.application_id = a.id) AS files_count,
                        (SELECT count(*) FROM team_memberships m WHERE m.venture_id = a.venture_id AND m.state = 'active') AS active_members_count
                 FROM applications a
@@ -1659,8 +1674,8 @@ class ParticipationService:
                     "dry_run": True,
                     "total_rows": len(rows),
                     "valid_count": len(valid_rows),
-                    "created_count": len(valid_rows),
-                    "imported_count": len(valid_rows),
+                    "created_count": 0,
+                    "imported_count": 0,
                     "error_count": len(row_errors),
                     "capacity_available": remaining,
                     "errors": row_errors,
@@ -1744,12 +1759,23 @@ class ParticipationService:
                 )
                 imported_ids.append(reg_id)
 
-            # Increment confirmed capacity
-            new_confirmed = confirmed + len(valid_rows)
+            # Increment confirmed capacity atomically (avoids lost updates and
+            # overbooking when concurrent imports run on PostgreSQL).
             cur.execute(
-                "UPDATE capacity_counters SET confirmed_count = ?, revision = revision + 1, updated_at = ? WHERE event_id = ?",
-                (new_confirmed, now, event_id),
+                """
+                UPDATE capacity_counters
+                SET confirmed_count = confirmed_count + ?, revision = revision + 1, updated_at = ?
+                WHERE event_id = ? AND confirmed_count + ? <= capacity
+                """,
+                (len(valid_rows), now, event_id, len(valid_rows)),
             )
+            if cur.rowcount != 1:
+                raise ProblemException(
+                    status=409,
+                    code="capacity_exceeded",
+                    title="Cupos insuficientes para importación",
+                    detail="La capacidad del evento cambió durante la importación y ya no hay cupos suficientes.",
+                )
 
             if imported_ids:
                 self._record_audit(
@@ -1809,9 +1835,10 @@ class ParticipationService:
         now = utc_now_iso()
         req_id = generate_uuidv7()
 
-        with self.db.transaction() as cur:
-            # Legal hold invariant: suspends/rejects erasure
-            if legal_hold and request_type == "erasure":
+        # Legal hold invariant: the rejection is evidence and must survive the
+        # error, so it is persisted in its own committed transaction.
+        if legal_hold and request_type == "erasure":
+            with self.db.transaction() as cur:
                 cur.execute(
                     """
                     INSERT INTO privacy_requests (
@@ -1820,13 +1847,14 @@ class ParticipationService:
                     """,
                     (req_id, org_id, email_hmac, request_type, now),
                 )
-                raise ProblemException(
-                    status=409,
-                    code="legal_hold_active",
-                    title="Retención legal activa (Legal Hold)",
-                    detail="La solicitud de supresión (erasure) no puede ejecutarse porque el titular se encuentra sujeto a una retención legal obligatoria (Ley 29733 / auditoría).",
-                )
+            raise ProblemException(
+                status=409,
+                code="legal_hold_active",
+                title="Retención legal activa (Legal Hold)",
+                detail="La solicitud de supresión (erasure) no puede ejecutarse porque el titular se encuentra sujeto a una retención legal obligatoria (Ley 29733 / auditoría).",
+            )
 
+        with self.db.transaction() as cur:
             if request_type == "erasure":
                 # 1. Anonymize registrations: crypto-shred PII and replace with tombstone
                 cur.execute("SELECT id FROM registrations WHERE email_hmac = ?", (email_hmac,))
@@ -1847,19 +1875,28 @@ class ParticipationService:
                         """,
                         (tombstone_pii, now, rid),
                     )
+                    # Questionnaire answers contain PII too: crypto-shred them.
+                    cur.execute("DELETE FROM registration_answers WHERE registration_id = ?", (rid,))
                     # Revoke active tickets
                     cur.execute(
                         "UPDATE tickets SET state = 'revoked', revoked_at = ? WHERE registration_id = ? AND state = 'active'",
                         (now, rid),
                     )
 
-                # 2. Anonymize team memberships
+                # 2. Anonymize team memberships and drop pending invitations
                 cur.execute(
                     "UPDATE team_memberships SET state = 'removed', email_masked = 'anonimizado@tombstone.internal', updated_at = ? WHERE email_hmac = ?",
                     (now, email_hmac),
                 )
+                cur.execute("DELETE FROM team_invitations WHERE email_hmac = ?", (email_hmac,))
 
-                # 3. Generate non-PII cryptographic receipt
+                # 3. Crypto-shred venture leader PII when the subject is a leader
+                cur.execute(
+                    "UPDATE ventures SET leader_pii_ciphertext = ?, revision = revision + 1, updated_at = ? WHERE leader_email_hmac = ?",
+                    (tombstone_pii, now, email_hmac),
+                )
+
+                # 4. Generate non-PII cryptographic receipt
                 tombstone_hash = hashlib.sha256(f"erased:{email_hmac}:{now}".encode("utf-8")).hexdigest()
                 evidence_payload = {
                     "receipt_id": req_id,
@@ -1916,9 +1953,52 @@ class ParticipationService:
                 )
                 return evidence_payload
 
-            # Access request
-            cur.execute("SELECT id, state, created_at, confirmed_at FROM registrations WHERE email_hmac = ?", (email_hmac,))
+            # Access / rectification requests: record the request for audit and
+            # return only non-sensitive registration metadata.
+            cur.execute(
+                "SELECT id, state, created_at, confirmed_at FROM registrations WHERE email_hmac = ?",
+                (email_hmac,),
+            )
             regs = [dict(r) for r in cur.fetchall()]
+            evidence_payload = {
+                "receipt_id": req_id,
+                "status": "completed",
+                "request_type": request_type,
+                "registrations_visible": len(regs),
+                "executed_at": now,
+                "legal_basis": "Ley_29733_Art_20",
+            }
+            cur.execute(
+                """
+                INSERT INTO privacy_requests (
+                    id, organization_id, email_hmac, request_type, legal_hold, state,
+                    evidence_json, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, 0, 'completed', ?, ?, ?)
+                """,
+                (
+                    req_id,
+                    org_id,
+                    email_hmac,
+                    request_type,
+                    json.dumps(evidence_payload, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            self._emit_outbox_event(
+                cur,
+                organization_id=org_id,
+                business_event_id=DEFAULT_EVENT_ID,
+                topic="participation.privacy_request.executed.v1",
+                aggregate_type="privacy_request",
+                aggregate_id=req_id,
+                aggregate_version=1,
+                data={
+                    "receipt_id": req_id,
+                    "request_type": request_type,
+                    "registrations_visible": len(regs),
+                },
+            )
             self._record_audit(
                 cur,
                 context=audit_context,
@@ -1929,11 +2009,17 @@ class ParticipationService:
                 result="success",
             )
             return {
-                "request_type": "access",
+                "receipt_id": req_id,
+                "request_type": request_type,
                 "email_masked": mask_email(clean_email),
                 "registrations_count": len(regs),
                 "records": regs,
                 "retention_policy": "5 años para certificaciones conforme a Ley 29733",
+                "receipt": {
+                    "receipt_id": req_id,
+                    "executed_at": now,
+                    "legal_basis": "Ley_29733_Art_20",
+                },
             }
 
     def create_operations_projection(
@@ -2182,8 +2268,10 @@ class ParticipationService:
                     data={
                         "invitation_id": inv_id,
                         "application_id": application_id,
+                        "venture_id": venture_id,
+                        "role": member.get("role", "co_founder"),
                         "state": "pending",
-                        "expires_at": now,
+                        "expires_at": inv_expiry,
                     },
                 )
 
@@ -2291,6 +2379,21 @@ class ParticipationService:
             )
 
         with self.db.transaction() as cur:
+            if idempotency_key:
+                cached = self._check_or_prepare_idempotency(
+                    cur,
+                    organization_id=DEFAULT_ORG_ID,
+                    operation=f"invite_team_member:{venture_id}",
+                    idempotency_key=idempotency_key,
+                    request_payload={
+                        "venture_id": venture_id,
+                        "email": clean_email,
+                        "role": role,
+                    },
+                )
+                if cached is not None:
+                    return cached[1]
+
             cur.execute("SELECT * FROM ventures WHERE id = ?", (venture_id,))
             v_row = cur.fetchone()
             if not v_row:
@@ -2371,7 +2474,7 @@ class ParticipationService:
                     "expires_at": expires_at,
                 },
             )
-            return {
+            result = {
                 "invitation_id": inv_id,
                 "venture_id": venture_id,
                 "email_masked": mask_email(clean_email),
@@ -2381,6 +2484,21 @@ class ParticipationService:
                 "expires_at": expires_at,
                 "created_at": now,
             }
+            if idempotency_key:
+                self._save_idempotency_result(
+                    cur,
+                    organization_id=org_id,
+                    operation=f"invite_team_member:{venture_id}",
+                    idempotency_key=idempotency_key,
+                    request_payload={
+                        "venture_id": venture_id,
+                        "email": clean_email,
+                        "role": role,
+                    },
+                    status_code=201,
+                    response_body=result,
+                )
+            return result
 
     def accept_invitation(self, token: str) -> Dict[str, Any]:
         """Invited member accepts invitation (PA-022)."""
@@ -2794,6 +2912,19 @@ class ParticipationService:
     ) -> Dict[str, Any]:
         """Submit venture application creating an immutable snapshot and sha256 hash (PA-025)."""
         with self.db.transaction() as cur:
+            cached = self._check_or_prepare_idempotency(
+                cur,
+                organization_id=DEFAULT_ORG_ID,
+                operation=f"submit_application:{application_id}",
+                idempotency_key=idempotency_key,
+                request_payload={
+                    "application_id": application_id,
+                    "expected_revision": expected_revision,
+                },
+            )
+            if cached is not None:
+                return cached[1]
+
             cur.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
             app_row = cur.fetchone()
             if not app_row:
@@ -2923,7 +3054,7 @@ class ParticipationService:
                     "form_version_id": app_row["form_version_id"],
                 },
             )
-            return {
+            result = {
                 "application_id": application_id,
                 "state": "submitted",
                 "revision": new_rev,
@@ -2931,6 +3062,19 @@ class ParticipationService:
                 "snapshot_hash": snapshot_hash,
                 "submitted_at": now,
             }
+            self._save_idempotency_result(
+                cur,
+                organization_id=org_id,
+                operation=f"submit_application:{application_id}",
+                idempotency_key=idempotency_key,
+                request_payload={
+                    "application_id": application_id,
+                    "expected_revision": expected_revision,
+                },
+                status_code=200,
+                response_body=result,
+            )
+            return result
 
     def withdraw_application(
         self,
@@ -3058,6 +3202,19 @@ class ParticipationService:
     ) -> Dict[str, Any]:
         """Applicant resubmits corrected application creating new revision number 2+ (PA-027)."""
         with self.db.transaction() as cur:
+            cached = self._check_or_prepare_idempotency(
+                cur,
+                organization_id=DEFAULT_ORG_ID,
+                operation=f"resubmit_application:{application_id}",
+                idempotency_key=idempotency_key,
+                request_payload={
+                    "application_id": application_id,
+                    "expected_revision": expected_revision,
+                },
+            )
+            if cached is not None:
+                return cached[1]
+
             cur.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
             app_row = cur.fetchone()
             if not app_row:
@@ -3171,7 +3328,7 @@ class ParticipationService:
                     "resubmitted_at": now,
                 },
             )
-            return {
+            result = {
                 "application_id": application_id,
                 "state": "resubmitted",
                 "revision": new_rev,
@@ -3179,6 +3336,19 @@ class ParticipationService:
                 "snapshot_hash": snapshot_hash,
                 "submitted_at": now,
             }
+            self._save_idempotency_result(
+                cur,
+                organization_id=org_id,
+                operation=f"resubmit_application:{application_id}",
+                idempotency_key=idempotency_key,
+                request_payload={
+                    "application_id": application_id,
+                    "expected_revision": expected_revision,
+                },
+                status_code=200,
+                response_body=result,
+            )
+            return result
 
     # -------------------------------------------------------------------------
     # PA-041 & PA-042: Outbox Inspector & Concurrency Burst Simulator
@@ -3190,7 +3360,7 @@ class ParticipationService:
                 SELECT message_id, domain_event_id, topic, aggregate_type,
                        aggregate_id, aggregate_version, partition_key, envelope_json, occurred_at
                 FROM outbox
-                ORDER BY rowid DESC
+                ORDER BY occurred_at DESC, message_id DESC
                 LIMIT ?
                 """,
                 (limit,),

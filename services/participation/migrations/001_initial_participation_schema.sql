@@ -309,6 +309,31 @@ CREATE TABLE IF NOT EXISTS outbox (
     attempts integer NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS privacy_requests (
+    id uuid PRIMARY KEY,
+    organization_id uuid NOT NULL,
+    email_hmac text NOT NULL,
+    request_type text NOT NULL CHECK (request_type IN ('access', 'rectification', 'erasure')),
+    legal_hold integer NOT NULL DEFAULT 0,
+    state text NOT NULL CHECK (state IN ('pending', 'completed', 'rejected')),
+    tombstone_receipt text,
+    evidence_json jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id uuid PRIMARY KEY,
+    organization_id uuid NOT NULL,
+    actor text NOT NULL,
+    action text NOT NULL,
+    target_type text NOT NULL,
+    target_id uuid NOT NULL,
+    reason text NOT NULL,
+    payload_json jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- =============================================================================
 -- ROW LEVEL SECURITY (RLS) OBLIGATORIO POR TENANT (AD-12)
 -- =============================================================================
@@ -333,7 +358,9 @@ BEGIN
         'application_files',
         'idempotency_keys',
         'inbox',
-        'outbox'
+        'outbox',
+        'privacy_requests',
+        'audit_logs'
     ]
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
