@@ -24,6 +24,12 @@ from app.db.database import (
     ParticipationDatabase,
 )
 from app.services.audit_service import AuditContext, AuditService
+from app.services.abuse_protection import (
+    CHALLENGE_HEADER,
+    DEVICE_HEADER,
+    PROOF_HEADER,
+    AbuseProtection,
+)
 from app.services.participation_service import ParticipationService
 
 
@@ -145,21 +151,121 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Request-Id", "ETag", "Cache-Control", "Retry-After"],
+        expose_headers=[
+            "X-Request-Id",
+            "ETag",
+            "Cache-Control",
+            "Retry-After",
+            "X-Participation-Device",
+        ],
     )
 
     db = ParticipationDatabase(db_path=db_path)
     audit_service = AuditService()
+    abuse_protection = AbuseProtection.from_env()
     service = ParticipationService(db=db, audit_service=audit_service)
     app.state.db = db
     app.state.service = service
     app.state.audit_service = audit_service
+    app.state.abuse_protection = abuse_protection
+
+    def protection_response(
+        *,
+        request_id: str,
+        status_code: int,
+        code: str,
+        detail: str,
+        device_token: str,
+        retry_after: Optional[int] = None,
+        challenge: Optional[dict[str, object]] = None,
+    ) -> JSONResponse:
+        body: dict[str, Any] = {
+            "type": f"https://errors.example.pe/{code.replace('_', '-')}",
+            "title": "Request protection required",
+            "status": status_code,
+            "code": code,
+            "detail": detail,
+            "request_id": request_id,
+        }
+        if challenge is not None:
+            body["challenge"] = challenge
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Request-Id": request_id,
+            DEVICE_HEADER: device_token,
+        }
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
+        return JSONResponse(
+            status_code=status_code,
+            content=body,
+            media_type="application/problem+json",
+            headers=headers,
+        )
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
         request_id = audit_service.assign_request_id(request)
+        if abuse_protection.protects(request.method, request.url.path):
+            peer_ip = request.client.host if request.client else "unknown"
+            event_match = abuse_protection.event_from_path(request.url.path)
+            device_token = request.headers.get(DEVICE_HEADER)
+            device_id = abuse_protection.verify_device_token(device_token)
+            issued_device_token = None
+            if device_id is None:
+                device_id, issued_device_token = abuse_protection.issue_device_token()
+
+            decision = abuse_protection.check_request(
+                peer_ip=peer_ip,
+                event_key=event_match,
+                device_id=(
+                    abuse_protection.verify_device_token(device_token)
+                    if device_token
+                    else None
+                ),
+            )
+            response_device_token = issued_device_token or device_token or ""
+            if not decision.allowed:
+                return protection_response(
+                    request_id=request_id,
+                    status_code=429,
+                    code="rate_limit_exceeded",
+                    detail="Too many requests. Retry after the indicated delay.",
+                    device_token=response_device_token,
+                    retry_after=decision.retry_after,
+                )
+
+            if decision.challenge_required:
+                challenge_result = abuse_protection.verify_and_consume_challenge(
+                    token=request.headers.get(CHALLENGE_HEADER),
+                    proof=request.headers.get(PROOF_HEADER),
+                    peer_ip=peer_ip,
+                    event_key=event_match,
+                    device_id=device_id,
+                )
+                if challenge_result != "valid":
+                    abuse_protection.record_challenged()
+                    challenge = abuse_protection.issue_challenge(
+                        peer_ip=peer_ip,
+                        event_key=event_match,
+                        device_id=device_id,
+                    )
+                    return protection_response(
+                        request_id=request_id,
+                        status_code=428,
+                        code=challenge_result,
+                        detail="Solve the one-use proof-of-work challenge and retry this request.",
+                        device_token=response_device_token,
+                        challenge=challenge,
+                    )
+
         response: Response = await call_next(request)
         response.headers["X-Request-Id"] = request_id
+        if abuse_protection.protects(request.method, request.url.path):
+            if issued_device_token:
+                response.headers[DEVICE_HEADER] = issued_device_token
+            elif device_token:
+                response.headers[DEVICE_HEADER] = device_token
         return response
 
     @app.exception_handler(ProblemException)

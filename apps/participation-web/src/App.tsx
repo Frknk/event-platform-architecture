@@ -9,6 +9,49 @@ function randomIdempotencyKey(prefix = 'idem-web'): string {
   return `${prefix}-${rand}`;
 }
 
+const DEVICE_TOKEN_STORAGE_KEY = 'participation-rate-limit-device';
+
+function getDeviceToken(): string | null {
+  return window.localStorage.getItem(DEVICE_TOKEN_STORAGE_KEY);
+}
+
+function saveDeviceToken(token: string | null): void {
+  if (token) {
+    window.localStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
+  }
+}
+
+async function solveProofOfWork(token: string, difficulty: number): Promise<string> {
+  if (!window.crypto?.subtle) {
+    throw new Error('El navegador no permite resolver el challenge criptográfico.');
+  }
+  const encodedPayload = token.split('.').slice(0, -1).join('.');
+  const base64Payload = encodedPayload.replace(/-/g, '+').replace(/_/g, '/');
+  const payload = JSON.parse(
+    atob(base64Payload + '='.repeat((4 - (base64Payload.length % 4)) % 4))
+  ) as { id: string };
+  const encoder = new TextEncoder();
+  for (let nonce = 0; nonce < 10_000_000; nonce += 1) {
+    const digest = new Uint8Array(
+      await window.crypto.subtle.digest(
+        'SHA-256',
+        encoder.encode(`${payload.id}:${nonce}`)
+      )
+    );
+    const fullBytes = Math.floor(difficulty / 8);
+    const remainingBits = difficulty % 8;
+    if (digest.slice(0, fullBytes).some((byte) => byte !== 0)) continue;
+    if (
+      remainingBits > 0 &&
+      digest[fullBytes] >> (8 - remainingBits) !== 0
+    ) {
+      continue;
+    }
+    return String(nonce);
+  }
+  throw new Error('No se pudo resolver el challenge antes del límite local.');
+}
+
 /**
  * Deterministic visual QR-style matrix SVG generated from the JWS signature
  * so the ticket QR renders cleanly with zero external network dependencies.
@@ -252,34 +295,54 @@ export default function App() {
 
     try {
       setLoading(true);
-      const res = await fetch(
-        `${API_BASE}/participation/public/v1/sites/${SITE_SLUG}/events/${EVENT_SLUG}/registrations`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Idempotency-Key': keyToUse,
-          },
-          body: JSON.stringify({
-            form_version_id: formConfig.form_version_id,
-            consent_version: formConfig.consent_version,
-            consent_accepted: consentAccepted,
-            attendee: {
-              full_name: fullName,
-              email,
-              document_number: documentNumber,
-              institution,
-            },
-            answers: {
-              track,
-              role_profile: roleProfile,
-              modality,
-            },
-          }),
+      const registrationUrl = `${API_BASE}/participation/public/v1/sites/${SITE_SLUG}/events/${EVENT_SLUG}/registrations`;
+      const registrationBody = JSON.stringify({
+        form_version_id: formConfig.form_version_id,
+        consent_version: formConfig.consent_version,
+        consent_accepted: consentAccepted,
+        attendee: {
+          full_name: fullName,
+          email,
+          document_number: documentNumber,
+          institution,
+        },
+        answers: {
+          track,
+          role_profile: roleProfile,
+          modality,
+        },
+      });
+      const submitRegistration = (challenge?: { token: string; proof: string }) => {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': keyToUse,
+        };
+        const deviceToken = getDeviceToken();
+        if (deviceToken) headers['X-Participation-Device'] = deviceToken;
+        if (challenge) {
+          headers['X-Participation-Challenge'] = challenge.token;
+          headers['X-Participation-Proof'] = challenge.proof;
         }
-      );
+        return fetch(registrationUrl, {
+          method: 'POST',
+          headers,
+          body: registrationBody,
+        });
+      };
 
-      const data = await res.json();
+      let res = await submitRegistration();
+      saveDeviceToken(res.headers.get('X-Participation-Device'));
+      let data = await res.json();
+      if (res.status === 428 && data.challenge?.token) {
+        const proof = await solveProofOfWork(
+          data.challenge.token,
+          data.challenge.difficulty
+        );
+        res = await submitRegistration({ token: data.challenge.token, proof });
+        saveDeviceToken(res.headers.get('X-Participation-Device'));
+        data = await res.json();
+      }
+
       if (!res.ok) {
         setBannerAlert({
           type: 'error',
@@ -308,6 +371,12 @@ export default function App() {
         });
       }
       await refreshAll(true);
+    } catch (err: any) {
+      setBannerAlert({
+        type: 'error',
+        title: 'No se pudo completar la inscripción',
+        detail: err?.message || 'Verifica tu conexión e inténtalo nuevamente.',
+      });
     } finally {
       setLoading(false);
     }
