@@ -14,6 +14,7 @@ _AUDIT_ACTIONS = {
     "reject_application",
     "import_registrations",
     "privacy_request",
+    "replay_event",
 }
 
 

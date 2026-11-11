@@ -121,6 +121,7 @@ class ParticipationDatabase:
         self,
         db_path: Optional[str] = None,
         db_url: Optional[str] = None,
+        initialize: bool = True,
     ) -> None:
         target = (
             db_url
@@ -161,8 +162,9 @@ class ParticipationDatabase:
                 self.db_path = str(Path(tempfile.gettempdir()) / "participation_service.db")
                 self._init_sqlite()
 
-        self.init_schema()
-        self.seed_default_release()
+        if initialize:
+            self.init_schema()
+            self.seed_default_release()
 
     def _init_sqlite(self) -> None:
         self._lock = threading.RLock()
@@ -401,6 +403,11 @@ class ParticipationDatabase:
                 raise FileNotFoundError(audit_migration)
             with self.transaction() as cur:
                 cur.execute(audit_migration.read_text(encoding="utf-8"))
+            reconciliation_migration = migrations_dir / "004_event_reconciliation.sql"
+            if not reconciliation_migration.exists():
+                raise FileNotFoundError(reconciliation_migration)
+            with self.transaction() as cur:
+                cur.execute(reconciliation_migration.read_text(encoding="utf-8"))
         else:
             with self.transaction() as cur:
                 cur.executescript(
@@ -672,6 +679,87 @@ class ParticipationDatabase:
                         attempts INTEGER NOT NULL DEFAULT 0
                     );
 
+                    CREATE TABLE IF NOT EXISTS outbox_deliveries (
+                        delivery_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        outbox_id TEXT NOT NULL REFERENCES outbox(id),
+                        message_id TEXT NOT NULL UNIQUE,
+                        domain_event_id TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        aggregate_type TEXT NOT NULL,
+                        aggregate_id TEXT NOT NULL,
+                        aggregate_version INTEGER NOT NULL,
+                        partition_key TEXT NOT NULL,
+                        envelope_json TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('pending', 'in_flight', 'published', 'dead_letter')
+                        ),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                        next_attempt_at TEXT NOT NULL,
+                        lease_token TEXT,
+                        lease_expires_at TEXT,
+                        last_error_code TEXT,
+                        replay_of_delivery_id TEXT REFERENCES outbox_deliveries(delivery_id),
+                        replay_request_hash TEXT,
+                        created_at TEXT NOT NULL,
+                        published_at TEXT,
+                        UNIQUE (organization_id, replay_request_hash)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_due
+                    ON outbox_deliveries (
+                        organization_id, state, next_attempt_at, lease_expires_at
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_domain_event
+                    ON outbox_deliveries (organization_id, domain_event_id);
+
+                    CREATE TABLE IF NOT EXISTS event_dead_letters (
+                        dead_letter_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        delivery_id TEXT NOT NULL UNIQUE
+                            REFERENCES outbox_deliveries(delivery_id),
+                        message_id TEXT NOT NULL,
+                        domain_event_id TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        error_code TEXT NOT NULL CHECK (
+                            error_code IN (
+                                'transport_unavailable', 'transport_timeout',
+                                'transport_rejected', 'invalid_envelope',
+                                'rate_limited', 'transport_error'
+                            )
+                        ),
+                        failed_at TEXT NOT NULL,
+                        replayed_at TEXT,
+                        replay_delivery_id TEXT REFERENCES outbox_deliveries(delivery_id)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_event_dead_letters_tenant
+                    ON event_dead_letters (organization_id, failed_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS event_gaps (
+                        gap_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        consumer_name TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        aggregate_id TEXT NOT NULL,
+                        expected_version INTEGER NOT NULL CHECK (expected_version > 0),
+                        observed_version INTEGER NOT NULL
+                            CHECK (observed_version > expected_version),
+                        detected_by_domain_event_id TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('open', 'resolved')),
+                        detected_at TEXT NOT NULL,
+                        resolved_at TEXT,
+                        UNIQUE (
+                            organization_id, consumer_name, aggregate_id, expected_version
+                        )
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_event_gaps_open
+                    ON event_gaps (organization_id, state, aggregate_id);
+
                     CREATE TABLE IF NOT EXISTS privacy_requests (
                         id TEXT PRIMARY KEY,
                         organization_id TEXT NOT NULL,
@@ -906,6 +994,9 @@ class ParticipationDatabase:
             cur.execute("DELETE FROM ventures")
             cur.execute("DELETE FROM idempotency_keys")
             cur.execute("DELETE FROM inbox")
+            cur.execute("DELETE FROM event_dead_letters")
+            cur.execute("DELETE FROM outbox_deliveries")
+            cur.execute("DELETE FROM event_gaps")
             cur.execute("DELETE FROM outbox")
             cur.execute("DELETE FROM privacy_requests")
             cur.execute("DELETE FROM capacity_counters")

@@ -18,9 +18,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.core.problem import ProblemException
 from app.core.security import generate_uuidv7
 from app.db.database import DEFAULT_ORG_ID
-from app.services.audit_service import AuditContext
+from app.services.audit_service import AuditContext, AuditService
+from app.services.event_delivery_service import (
+    DeliveryReceipt,
+    OutboxDeliveryService,
+    TransportError,
+)
 
 PG_URL = os.environ.get("TEST_DATABASE_URL") or ""
 
@@ -244,3 +250,107 @@ def test_pg_audit_insert_failure_rolls_back_admin_correction(client):
     assert current_registration == original_registration
     assert correction_audit_count == 0
     assert collision_audit_count == 1
+
+
+def test_pg_outbox_delivery_dlq_replay_and_gap_reconciliation(client):
+    reset = client.post("/participation/v1/demo/reset", json={"capacity": 5})
+    assert reset.status_code == 200
+    db = client.app.state.db
+    service = client.app.state.service
+    with db.transaction() as cur:
+        event = service._emit_outbox_event(
+            cur,
+            organization_id=DEFAULT_ORG_ID,
+            business_event_id="0192f000-0000-7000-8000-000000000101",
+            topic="participation.registration.created.v1",
+            aggregate_type="registration",
+            aggregate_id=generate_uuidv7(),
+            aggregate_version=1,
+            data={"state": "confirmed"},
+        )
+
+    class RejectingTransport:
+        def publish(self, envelope, *, headers):
+            raise TransportError("transport_rejected", retryable=False)
+
+    dead = OutboxDeliveryService(db, RejectingTransport(), max_attempts=1).process_once(
+        organization_id=DEFAULT_ORG_ID
+    )
+    assert dead["dead_lettered"] == 1
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT delivery_id FROM outbox_deliveries WHERE message_id = ?",
+            (event["message_id"],),
+        )
+        dead_delivery_id = cur.fetchone()["delivery_id"]
+
+    context = AuditContext(
+        request_id=generate_uuidv7(),
+        actor_type="service",
+        actor_id="verified-test-service",
+    )
+    replay = OutboxDeliveryService(db, None).replay_dead_letter(
+        organization_id=DEFAULT_ORG_ID,
+        delivery_id=dead_delivery_id,
+        idempotency_key=f"pg-replay-{generate_uuidv7()}",
+        audit_context=context,
+    )
+
+    class AcceptingTransport:
+        def publish(self, envelope, *, headers):
+            assert envelope["domain_event_id"] == event["domain_event_id"]
+            assert envelope["occurred_at"] == event["occurred_at"]
+            assert headers == {"replay": "true"}
+            return DeliveryReceipt(envelope["message_id"], True)
+
+    delivered = OutboxDeliveryService(db, AcceptingTransport()).process_once(
+        organization_id=DEFAULT_ORG_ID
+    )
+    assert delivered["published"] == 1
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT state FROM outbox_deliveries WHERE delivery_id = ?",
+            (replay["delivery_id"],),
+        )
+        assert cur.fetchone()["state"] == "published"
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM audit_logs "
+            "WHERE action = 'replay_event' AND target_id = ?",
+            (dead_delivery_id,),
+        )
+        assert cur.fetchone()["count"] == 1
+        cur.execute(
+            """
+            SELECT r.rolsuper, r.rolbypassrls
+            FROM pg_roles r WHERE r.rolname = current_user
+            """
+        )
+        role = cur.fetchone()
+        assert not role["rolsuper"]
+        assert not role["rolbypassrls"]
+
+    other_tenant = "0192f000-0000-0000-8000-000000000099"
+    with db.read_cursor(org_id=other_tenant) as cur:
+        cur.execute("SELECT COUNT(*) AS count FROM outbox_deliveries")
+        assert cur.fetchone()["count"] == 0
+
+    def release_envelope(version: int) -> dict:
+        return {
+            "domain_event_id": generate_uuidv7(),
+            "topic": "configuration.event.release_published.v1",
+            "organization_id": DEFAULT_ORG_ID,
+            "business_event_id": "0192f000-0000-0000-8000-000000000101",
+            "aggregate": {
+                "id": "0192f000-0000-0000-8000-000000000101",
+                "version": version,
+            },
+            "data": {"capacity": 5, "waitlist_enabled": True},
+        }
+
+    ingestor = service.ingest_release_published
+    assert ingestor(release_envelope(1))["status"] == "materialized"
+    with pytest.raises(ProblemException) as gap:
+        ingestor(release_envelope(3))
+    assert gap.value.code == "release_gap"
+    assert ingestor(release_envelope(2))["status"] == "materialized"
+    assert ingestor(release_envelope(3))["status"] == "materialized"
