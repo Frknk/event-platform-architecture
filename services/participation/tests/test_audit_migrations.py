@@ -231,7 +231,7 @@ class PostgreSQLAuditMigrationTests(unittest.TestCase):
                         for index, key in enumerate(LEGACY_AUDIT_ROW):
                             value = row[index]
                             expected = LEGACY_AUDIT_ROW[key]
-                            if key == "organization_id":
+                            if isinstance(value, uuid.UUID):
                                 value = str(value)
                             elif key == "payload_json":
                                 value = json.dumps(value, separators=(",", ":"))

@@ -12,12 +12,15 @@ migration and the post-migration tables on startup.
 from __future__ import annotations
 
 import os
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.core.security import generate_uuidv7
+from app.db.database import DEFAULT_ORG_ID
+from app.services.audit_service import AuditContext
 
 PG_URL = os.environ.get("TEST_DATABASE_URL") or ""
 
@@ -29,6 +32,21 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def client():
+    try:
+        import psycopg
+    except ImportError:
+        pytest.skip("psycopg is not installed.")
+
+    with psycopg.connect(PG_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database()")
+            database_name = cur.fetchone()[0]
+    if not database_name.endswith("_test"):
+        pytest.skip(
+            "PostgreSQL integration tests require a disposable database "
+            "whose name ends in '_test'."
+        )
+
     os.environ["DATABASE_URL"] = PG_URL
     os.environ.pop("PARTICIPATION_SQLITE_PATH", None)
     app = create_app()
@@ -134,3 +152,95 @@ def test_pg_outbox_listing_does_not_use_sqlite_rowid(client):
     outbox = client.get("/participation/v1/outbox", params={"limit": 10})
     assert outbox.status_code == 200, outbox.text
     assert "items" in outbox.json()
+
+
+def test_pg_audit_insert_failure_rolls_back_admin_correction(client):
+    reset = client.post("/participation/v1/demo/reset", json={"capacity": 5})
+    assert reset.status_code == 200
+
+    reg = client.post(
+        "/participation/public/v1/sites/incuba-unas/events/congreso-innovacion-demo-day-2026/registrations",
+        json=_registration_payload("pg.atomic@unas.edu.pe"),
+        headers={"Idempotency-Key": f"pg-atomic-{generate_uuidv7()}"},
+    )
+    assert reg.status_code == 201, reg.text
+    registration_id = reg.json()["id"]
+
+    db = client.app.state.db
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT pii_ciphertext, revision FROM registrations WHERE id = ?",
+            (registration_id,),
+        )
+        original_registration = dict(cur.fetchone())
+
+    audit_service = client.app.state.audit_service
+    conflicting_audit_id = generate_uuidv7()
+    with patch(
+        "app.services.audit_service.generate_uuidv7",
+        return_value=conflicting_audit_id,
+    ):
+        with db.transaction() as cur:
+            audit_service.record(
+                cur,
+                context=AuditContext(
+                    request_id=f"fixture-{generate_uuidv7()}",
+                    actor_type=None,
+                    actor_id=None,
+                ),
+                organization_id=DEFAULT_ORG_ID,
+                action="privacy_request",
+                target_type="test-fixture",
+                target_id=generate_uuidv7(),
+                result="failed",
+            )
+
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM audit_logs WHERE id = ?",
+            (conflicting_audit_id,),
+        )
+        assert cur.fetchone()["count"] == 1
+
+    with (
+        patch.object(audit_service, "record", wraps=audit_service.record) as record_audit,
+        patch(
+            "app.services.audit_service.generate_uuidv7",
+            return_value=conflicting_audit_id,
+        ),
+    ):
+        correction = client.patch(
+            f"/participation/v1/registrations/{registration_id}",
+            json={
+                "reason": "Debe revertirse si falla la auditoría",
+                "updates": {"full_name": "Changed Name"},
+            },
+        )
+
+    assert correction.status_code == 500
+    record_audit.assert_called_once()
+
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT pii_ciphertext, revision FROM registrations WHERE id = ?",
+            (registration_id,),
+        )
+        current_registration = dict(cur.fetchone())
+        cur.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM audit_logs
+            WHERE action = 'correct_registration' AND target_id = ?
+            """,
+            (registration_id,),
+        )
+        correction_audit_count = cur.fetchone()["count"]
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM audit_logs WHERE id = ?",
+            (conflicting_audit_id,),
+        )
+        collision_audit_count = cur.fetchone()["count"]
+
+    assert current_registration == original_registration
+    assert correction_audit_count == 0
+    assert collision_audit_count == 1
