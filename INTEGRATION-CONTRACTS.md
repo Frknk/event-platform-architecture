@@ -30,6 +30,13 @@ Este documento es el índice normativo de integración. El inventario HTTP compl
 4. **Certificación:** Operations consume asistencia y una proyección cifrada autorizada, evalúa una regla versionada y emite PDF idempotente.
 5. **HukID opcional:** el adaptador del Equipo 4 toma un certificado elegible y consentimiento vigente, crea una issuance request por HTTPS/OAuth2 e idempotencia, guarda el ID externo y reconcilia hasta estado terminal. El Equipo 5 no consume eventos de Events.
 
+## Entrega de eventos (PA-042)
+
+- El envelope nace con `published_at: null` y `attempts: 0`; sólo el worker de entrega lo completa cuando el transporte confirma `message_id` y `accepted=true`.
+- La entrega es at-least-once con lease: un crash tras la aceptación remota puede reenviar. Los consumidores deduplican por `domain_event_id`.
+- Los envelopes inválidos y los fallos permanentes terminan en `event_dead_letters`; los reintentos usan backoff con jitter y un límite de intentos.
+- Los releases con `aggregate.version` menor al esperado se registran en `inbox` pero no se proyectan (`stale_ignored`); los huecos hacia adelante se registran en `event_gaps` y se rechazan con `409 release_gap`.
+
 ## Ticket y caché
 
 - QR JWS asimétrico: `jti` opaco, `kid`, `aud=onsite`, organización, evento, scope, `iat`, `exp` y versión; sin PII.

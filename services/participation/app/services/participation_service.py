@@ -34,6 +34,7 @@ from app.core.security import (
     security_manager,
     utc_now_iso,
 )
+from app.services.audit_service import AuditContext, AuditResult, AuditService
 from app.db.database import (
     DEFAULT_CONSENT_VERSION,
     DEFAULT_EVENT_ID,
@@ -48,8 +49,34 @@ from app.db.database import (
 class ParticipationService:
     """Core transactional engine for Team 3 — Participation."""
 
-    def __init__(self, db: ParticipationDatabase) -> None:
+    def __init__(self, db: ParticipationDatabase, audit_service: AuditService) -> None:
         self.db = db
+        self.audit_service = audit_service
+
+    def _record_audit(
+        self,
+        cur: Any,
+        *,
+        context: AuditContext,
+        organization_id: str,
+        action: str,
+        target_type: str,
+        target_id: str,
+        result: AuditResult,
+        reason: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.audit_service.record(
+            cur,
+            context=context,
+            organization_id=organization_id,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            result=result,
+            reason=reason,
+            payload=payload,
+        )
 
     # -------------------------------------------------------------------------
     # Transactional Outbox & Inbox Helpers (EVENT-CONTRACTS.md)
@@ -85,7 +112,7 @@ class ParticipationService:
             "organization_id": organization_id,
             "business_event_id": business_event_id,
             "occurred_at": now,
-            "published_at": now,
+            "published_at": None,
             "actor": {"type": actor_type, "id": actor_id},
             "traceparent": f"00-{corr_id.replace('-', '')}-0192f00000007000-01",
             "correlation_id": corr_id,
@@ -98,16 +125,17 @@ class ParticipationService:
             "partition_key": partition_key,
             "data": data,
         }
+        outbox_id = generate_uuidv7()
         cur.execute(
             """
             INSERT INTO outbox (
                 id, message_id, domain_event_id, organization_id, business_event_id,
                 topic, schema_version, aggregate_type, aggregate_id, aggregate_version,
                 partition_key, envelope_json, occurred_at, published_at, attempts
-            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, 0)
             """,
             (
-                generate_uuidv7(),
+                outbox_id,
                 message_id,
                 domain_event_id,
                 organization_id,
@@ -118,6 +146,31 @@ class ParticipationService:
                 aggregate_version,
                 partition_key,
                 json.dumps(envelope, ensure_ascii=False),
+                now,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO outbox_deliveries (
+                delivery_id, organization_id, outbox_id, message_id,
+                domain_event_id, topic, aggregate_type, aggregate_id,
+                aggregate_version, partition_key, envelope_json, occurred_at,
+                state, attempts, next_attempt_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            """,
+            (
+                generate_uuidv7(),
+                organization_id,
+                outbox_id,
+                message_id,
+                domain_event_id,
+                topic,
+                aggregate_type,
+                aggregate_id,
+                aggregate_version,
+                partition_key,
+                json.dumps(envelope, ensure_ascii=False),
+                now,
                 now,
                 now,
             ),
@@ -219,77 +272,230 @@ class ParticipationService:
     # -------------------------------------------------------------------------
     # PA-010: Materialize Release from Event Configuration
     # -------------------------------------------------------------------------
-    def ingest_release_published(self, event_envelope: Dict[str, Any]) -> Dict[str, Any]:
+    def ingest_release_published(
+        self,
+        event_envelope: Dict[str, Any],
+        *,
+        trusted_organization_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Consume configuration.event.release_published.v1 idempotently via inbox (PA-010)."""
-        domain_event_id = event_envelope.get("domain_event_id") or generate_uuidv7()
-        org_id = event_envelope.get("organization_id", DEFAULT_ORG_ID)
-        event_id = event_envelope.get("business_event_id", DEFAULT_EVENT_ID)
+        domain_event_id = event_envelope.get("domain_event_id")
+        org_id = event_envelope.get("organization_id")
+        event_id = event_envelope.get("business_event_id")
         agg = event_envelope.get("aggregate", {})
-        agg_version = int(agg.get("version", 1))
-        data = event_envelope.get("data", {})
-
-        with self.db.transaction() as cur:
-            cur.execute(
-                "SELECT id FROM inbox WHERE consumer_name = 'participation' AND domain_event_id = ?",
-                (domain_event_id,),
+        if not isinstance(agg, dict):
+            raise ProblemException(
+                status=400,
+                code="validation_error",
+                title="Invalid event aggregate",
+                detail="Aggregate metadata must be an object.",
             )
-            if cur.fetchone():
-                return {"status": "duplicate_ignored", "domain_event_id": domain_event_id}
+        aggregate_id = agg.get("id") or event_id
+        agg_version = agg.get("version")
+        data = event_envelope.get("data", {})
+        topic = event_envelope.get("topic")
 
-            now = utc_now_iso()
+        if not isinstance(data, dict):
+            raise ProblemException(
+                status=400,
+                code="validation_error",
+                title="Invalid event data",
+                detail="Event data must be an object.",
+            )
+        if not all((domain_event_id, org_id, event_id, aggregate_id, topic)):
+            raise ProblemException(
+                status=400,
+                code="validation_error",
+                title="Incomplete event envelope",
+                detail="Required event identity and tenant fields are missing.",
+            )
+        try:
+            uuid.UUID(str(domain_event_id))
+            uuid.UUID(str(org_id))
+            uuid.UUID(str(event_id))
+            uuid.UUID(str(aggregate_id))
+            if isinstance(agg_version, bool) or not str(agg_version).isdigit():
+                raise ValueError("Aggregate version must be a positive integer.")
+            agg_version = int(agg_version)
+        except (TypeError, ValueError) as err:
+            raise ProblemException(
+                status=400,
+                code="validation_error",
+                title="Invalid event envelope",
+                detail="Event identifiers and aggregate version must be valid.",
+            ) from err
+        if agg_version < 1:
+            raise ProblemException(
+                status=400,
+                code="validation_error",
+                title="Invalid event version",
+                detail="Aggregate version must be positive.",
+            )
+        if topic != "configuration.event.release_published.v1":
+            raise ProblemException(
+                status=400,
+                code="validation_error",
+                title="Unsupported event topic",
+                detail="This consumer only accepts published release events.",
+            )
+        expected_org_id = trusted_organization_id or DEFAULT_ORG_ID
+        if org_id != expected_org_id:
+            raise ProblemException(
+                status=403,
+                code="tenant_forbidden",
+                title="Tenant is not available in the local consumer",
+                detail="Event organization does not match the trusted consumer context.",
+            )
+
+        gap_detected: Optional[Dict[str, int]] = None
+        stale_version: Optional[Dict[str, int]] = None
+        result: Optional[Dict[str, Any]] = None
+        with self.db.transaction(org_id=org_id) as cur:
+            if self.db.backend == "postgres":
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                    (f"{org_id}:{aggregate_id}:{topic}",),
+                )
             cur.execute(
                 """
                 INSERT INTO inbox (
                     id, organization_id, consumer_name, domain_event_id,
                     topic, aggregate_id, aggregate_version, processed_at
                 ) VALUES (?, ?, 'participation', ?, ?, ?, ?, ?)
+                ON CONFLICT (consumer_name, domain_event_id) DO NOTHING
                 """,
                 (
                     generate_uuidv7(),
                     org_id,
                     domain_event_id,
-                    event_envelope.get("topic", "configuration.event.release_published.v1"),
-                    event_id,
+                    topic,
+                    aggregate_id,
                     agg_version,
-                    now,
+                    utc_now_iso(),
                 ),
             )
-
-            new_capacity = int(data.get("capacity", 5))
-            waitlist_enabled = bool(data.get("waitlist_enabled", True))
+            if cur.rowcount == 0:
+                return {"status": "duplicate_ignored", "domain_event_id": domain_event_id}
 
             cur.execute(
-                "SELECT confirmed_count FROM capacity_counters WHERE event_id = ?",
-                (event_id,),
+                """
+                SELECT MAX(aggregate_version) AS max_version
+                FROM inbox
+                WHERE organization_id = ? AND consumer_name = 'participation'
+                  AND aggregate_id = ? AND topic = ?
+                  AND domain_event_id <> ?
+                """,
+                (org_id, aggregate_id, topic, domain_event_id),
             )
-            cap_row = cur.fetchone()
-            if cap_row:
-                if new_capacity < int(cap_row["confirmed_count"]):
-                    raise ProblemException(
-                        status=409,
-                        code="invalid_state_transition",
-                        title="Operational capacity conflict",
-                        detail=(
-                            f"Cannot reduce capacity ({new_capacity}) below already confirmed "
-                            f"registrations ({cap_row['confirmed_count']})."
-                        ),
-                    )
+            latest = cur.fetchone()["max_version"]
+            expected_version = (int(latest) if latest is not None else 0) + 1
+            if agg_version > expected_version:
+                now = utc_now_iso()
+                cur.execute(
+                    "DELETE FROM inbox WHERE consumer_name = 'participation' "
+                    "AND domain_event_id = ?",
+                    (domain_event_id,),
+                )
                 cur.execute(
                     """
-                    UPDATE capacity_counters
-                    SET capacity = ?, waitlist_enabled = ?, revision = revision + 1, updated_at = ?
-                    WHERE event_id = ?
+                    INSERT INTO event_gaps (
+                        gap_id, organization_id, consumer_name, topic, aggregate_id,
+                        expected_version, observed_version, detected_by_domain_event_id,
+                        state, detected_at
+                    ) VALUES (?, ?, 'participation', ?, ?, ?, ?, ?, 'open', ?)
+                    ON CONFLICT (
+                        organization_id, consumer_name, aggregate_id, expected_version
+                    ) DO NOTHING
                     """,
-                    (new_capacity, waitlist_enabled, now, event_id),
+                    (
+                        generate_uuidv7(),
+                        org_id,
+                        topic,
+                        aggregate_id,
+                        expected_version,
+                        agg_version,
+                        domain_event_id,
+                        now,
+                    ),
                 )
+                gap_detected = {
+                    "expected_version": expected_version,
+                    "observed_version": agg_version,
+                }
+            elif agg_version < expected_version:
+                # Late/duplicate version: record that it was received but never
+                # let an older snapshot overwrite a newer projection.
+                stale_version = {
+                    "expected_version": expected_version,
+                    "observed_version": agg_version,
+                }
+            else:
+                now = utc_now_iso()
+                cur.execute(
+                    """
+                    UPDATE event_gaps
+                    SET state = 'resolved', resolved_at = ?
+                    WHERE organization_id = ? AND consumer_name = 'participation'
+                      AND aggregate_id = ? AND expected_version = ? AND state = 'open'
+                    """,
+                    (utc_now_iso(), org_id, aggregate_id, agg_version),
+                )
+                new_capacity = int(data.get("capacity", 5))
+                waitlist_enabled = bool(data.get("waitlist_enabled", True))
 
+                cur.execute(
+                    "SELECT confirmed_count FROM capacity_counters WHERE event_id = ?",
+                    (event_id,),
+                )
+                cap_row = cur.fetchone()
+                if cap_row:
+                    if new_capacity < int(cap_row["confirmed_count"]):
+                        raise ProblemException(
+                            status=409,
+                            code="invalid_state_transition",
+                            title="Operational capacity conflict",
+                            detail=(
+                                f"Cannot reduce capacity ({new_capacity}) below already confirmed "
+                                f"registrations ({cap_row['confirmed_count']})."
+                            ),
+                        )
+                    cur.execute(
+                        """
+                        UPDATE capacity_counters
+                        SET capacity = ?, waitlist_enabled = ?, revision = revision + 1, updated_at = ?
+                        WHERE event_id = ?
+                        """,
+                        (new_capacity, waitlist_enabled, now, event_id),
+                    )
+                result = {
+                    "status": "materialized",
+                    "domain_event_id": domain_event_id,
+                    "event_id": event_id,
+                    "capacity": new_capacity,
+                    "waitlist_enabled": bool(waitlist_enabled),
+                }
+
+        if stale_version is not None:
             return {
-                "status": "materialized",
+                "status": "stale_ignored",
                 "domain_event_id": domain_event_id,
                 "event_id": event_id,
-                "capacity": new_capacity,
-                "waitlist_enabled": bool(waitlist_enabled),
+                "expected_version": stale_version["expected_version"],
+                "observed_version": stale_version["observed_version"],
             }
+        if gap_detected is not None:
+            raise ProblemException(
+                status=409,
+                code="release_gap",
+                title="Release event sequence gap",
+                detail=(
+                    f"Expected aggregate version {gap_detected['expected_version']} "
+                    f"before version {gap_detected['observed_version']}."
+                ),
+            )
+        if result is None:
+            raise RuntimeError("Release processing completed without a result.")
+        return result
 
     # -------------------------------------------------------------------------
     # PA-001: Get Active Public Form
@@ -1324,7 +1530,7 @@ class ParticipationService:
         registration_id: str,
         reason: str,
         updates: Dict[str, Any],
-        actor: str = "manager",
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-031: Manager corrects allowlisted admin fields without altering questionnaire answers or snapshot."""
         if not reason or len(reason.strip()) < 3:
@@ -1377,25 +1583,18 @@ class ParticipationService:
                 (new_ciphertext, new_name_masked, now, registration_id),
             )
 
-            # Record audit log
-            cur.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, organization_id, actor, action, target_type, target_id, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, 'correct_registration', 'registration', ?, ?, ?, ?)
-                """,
-                (
-                    generate_uuidv7(),
-                    org_id,
-                    actor,
-                    registration_id,
-                    reason,
-                    json.dumps({"updated_fields": list(updates.keys())}, ensure_ascii=False),
-                    now,
-                ),
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="correct_registration",
+                target_type="registration",
+                target_id=registration_id,
+                result="success",
+                reason=reason,
+                payload={"updated_fields": sorted(updates.keys())},
             )
 
-            # Emit audit event
             self._emit_outbox_event(
                 cur,
                 organization_id=org_id,
@@ -1408,7 +1607,7 @@ class ParticipationService:
                     "registration_id": registration_id,
                     "updated_fields": list(updates.keys()),
                     "reason": reason,
-                    "actor": actor,
+                    "actor": audit_context.actor_id or "unattributed",
                     "corrected_at": now,
                 },
             )
@@ -1459,7 +1658,7 @@ class ParticipationService:
         expected_revision: int,
         reason: str,
         checklist: Optional[Dict[str, bool]] = None,
-        actor: str = "reviewer",
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-032: Reviewer admits application after validating admissibility checklist."""
         with self.db.transaction() as cur:
@@ -1482,21 +1681,16 @@ class ParticipationService:
                 (new_rev, now, application_id),
             )
 
-            cur.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, organization_id, actor, action, target_type, target_id, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, 'admit_application', 'application', ?, ?, ?, ?)
-                """,
-                (
-                    generate_uuidv7(),
-                    org_id,
-                    actor,
-                    application_id,
-                    reason,
-                    json.dumps({"checklist": checklist or {}}, ensure_ascii=False),
-                    now,
-                ),
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="admit_application",
+                target_type="application",
+                target_id=application_id,
+                result="success",
+                reason=reason,
+                payload={"checklist": checklist or {}},
             )
 
             self._emit_outbox_event(
@@ -1531,7 +1725,7 @@ class ParticipationService:
         expected_revision: int,
         reason: str,
         checklist: Optional[Dict[str, bool]] = None,
-        actor: str = "reviewer",
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-032: Reviewer rejects application with justification."""
         with self.db.transaction() as cur:
@@ -1554,21 +1748,16 @@ class ParticipationService:
                 (new_rev, now, application_id),
             )
 
-            cur.execute(
-                """
-                INSERT INTO audit_logs (
-                    id, organization_id, actor, action, target_type, target_id, reason, payload_json, created_at
-                ) VALUES (?, ?, ?, 'reject_application', 'application', ?, ?, ?, ?)
-                """,
-                (
-                    generate_uuidv7(),
-                    org_id,
-                    actor,
-                    application_id,
-                    reason,
-                    json.dumps({"checklist": checklist or {}}, ensure_ascii=False),
-                    now,
-                ),
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="reject_application",
+                target_type="application",
+                target_id=application_id,
+                result="success",
+                reason=reason,
+                payload={"checklist": checklist or {}},
             )
 
             self._emit_outbox_event(
@@ -1601,6 +1790,7 @@ class ParticipationService:
         rows: List[Dict[str, Any]],
         legal_basis: str,
         dry_run: bool = False,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-033: Controlled batch/CSV registration import with dry-run, row-level errors and explicit legal basis."""
         if not legal_basis or len(legal_basis.strip()) < 3:
@@ -1770,6 +1960,22 @@ class ParticipationService:
                     detail="La capacidad del evento cambió durante la importación y ya no hay cupos suficientes.",
                 )
 
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="import_registrations",
+                target_type="event",
+                target_id=event_id,
+                result="success",
+                reason=legal_basis,
+                payload={
+                    "created_count": len(imported_ids),
+                    "error_count": len(row_errors),
+                    "dry_run": False,
+                },
+            )
+
             self._emit_outbox_event(
                 cur,
                 organization_id=org_id,
@@ -1802,6 +2008,7 @@ class ParticipationService:
         request_type: str,
         legal_hold: bool = False,
         reason: Optional[str] = None,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-034: ARCO Privacy Request handler with Legal Hold protection, erasure/tombstone and zero-PII cryptographic receipt."""
         clean_email = email.strip().lower()
@@ -1923,6 +2130,20 @@ class ParticipationService:
                         "registrations_anonymized": len(reg_ids),
                     },
                 )
+                self._record_audit(
+                    cur,
+                    context=audit_context,
+                    organization_id=org_id,
+                    action="privacy_request",
+                    target_type="privacy_request",
+                    target_id=req_id,
+                    result="success",
+                    reason=reason or "privacy_erasure",
+                    payload={
+                        "request_type": "erasure",
+                        "registrations_anonymized": len(reg_ids),
+                    },
+                )
                 return evidence_payload
 
             # Access / rectification requests: record the request for audit and
@@ -1967,6 +2188,20 @@ class ParticipationService:
                 aggregate_version=1,
                 data={
                     "receipt_id": req_id,
+                    "request_type": request_type,
+                    "registrations_visible": len(regs),
+                },
+            )
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="privacy_request",
+                target_type="privacy_request",
+                target_id=req_id,
+                result="success",
+                reason=reason or f"privacy_{request_type}",
+                payload={
                     "request_type": request_type,
                     "registrations_visible": len(regs),
                 },

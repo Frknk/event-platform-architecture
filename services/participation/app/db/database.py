@@ -39,6 +39,15 @@ DEFAULT_FORM_VERSION_ID = "0192f000-0000-7000-8000-000000000301"
 DEFAULT_CONSENT_VERSION = "consent-unas-v1.0"
 DEFAULT_POSTGRES_URL = "postgresql://participation_app:participation_local_secret@127.0.0.1:5434/participation_db"
 
+# Applied in order on every startup. Every migration in this list is
+# idempotent, so a database provisioned before a migration existed is repaired
+# instead of silently missing it.
+_POSTGRES_INCREMENTAL_MIGRATIONS = (
+    "002_audit_logs_enrichment.sql",
+    "003_audit_retention.sql",
+    "004_event_reconciliation.sql",
+)
+
 
 class PostgresRow(dict):
     """Dictionary subclass providing dict/sqlite3.Row compatible item access."""
@@ -121,6 +130,7 @@ class ParticipationDatabase:
         self,
         db_path: Optional[str] = None,
         db_url: Optional[str] = None,
+        initialize: bool = True,
     ) -> None:
         target = (
             db_url
@@ -161,8 +171,9 @@ class ParticipationDatabase:
                 self.db_path = str(Path(tempfile.gettempdir()) / "participation_service.db")
                 self._init_sqlite()
 
-        self.init_schema()
-        self.seed_default_release()
+        if initialize:
+            self.init_schema()
+            self.seed_default_release()
 
     def _init_sqlite(self) -> None:
         self._lock = threading.RLock()
@@ -172,6 +183,7 @@ class ParticipationDatabase:
             isolation_level=None,
         )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA recursive_triggers = ON")
 
     def _init_postgres(self) -> None:
         try:
@@ -240,22 +252,169 @@ class ParticipationDatabase:
                 finally:
                     cursor.close()
 
+    def _migrate_audit_logs_sqlite(self) -> None:
+        with self.transaction() as cur:
+            cur.execute("PRAGMA table_info(audit_logs)")
+            columns = {row["name"] for row in cur.fetchall()}
+            if not columns:
+                raise RuntimeError("SQLite audit_logs table was not initialized.")
+
+            for column in ("actor_type", "actor_id", "result", "request_id"):
+                if column not in columns:
+                    cur.execute(f"ALTER TABLE audit_logs ADD COLUMN {column} TEXT")
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_target_created
+                ON audit_logs (organization_id, target_type, target_id, created_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_request
+                ON audit_logs (organization_id, request_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_legal_hold_events (
+                    event_id TEXT PRIMARY KEY,
+                    hold_id TEXT NOT NULL,
+                    organization_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK (event_type IN ('placed', 'released')),
+                    authority_ref_digest TEXT NOT NULL
+                        CHECK (
+                            length(authority_ref_digest) = 64
+                            AND authority_ref_digest NOT GLOB '*[^0-9a-f]*'
+                        ),
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    UNIQUE (organization_id, hold_id, event_type)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_legal_hold_target
+                ON audit_legal_hold_events (
+                    organization_id, target_type, target_id, hold_id, event_type
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_logs_no_update
+                BEFORE UPDATE ON audit_logs
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_logs is append-only');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_logs_guard_delete
+                BEFORE DELETE ON audit_logs
+                BEGIN
+                    SELECT CASE
+                        WHEN julianday(OLD.created_at) IS NULL
+                          OR julianday(OLD.created_at) > julianday('now', '-2 years')
+                        THEN RAISE(ABORT, 'audit retention period has not expired')
+                    END;
+                    SELECT CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM audit_legal_hold_events placed
+                            WHERE placed.organization_id = OLD.organization_id
+                              AND placed.target_type = OLD.target_type
+                              AND placed.target_id = OLD.target_id
+                              AND placed.event_type = 'placed'
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM audit_legal_hold_events released
+                                  WHERE released.organization_id = placed.organization_id
+                                    AND released.hold_id = placed.hold_id
+                                    AND released.event_type = 'released'
+                              )
+                        )
+                        THEN RAISE(ABORT, 'audit record is protected by legal hold')
+                    END;
+                    SELECT RAISE(ABORT, 'audit purge is disabled pending maintenance authorization');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_legal_hold_events_no_update
+                BEFORE UPDATE ON audit_legal_hold_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit legal hold events are append-only');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_legal_hold_events_no_delete
+                BEFORE DELETE ON audit_legal_hold_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit legal hold events are append-only');
+                END
+                """
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_legal_hold_release_requires_active_hold
+                BEFORE INSERT ON audit_legal_hold_events
+                WHEN NEW.event_type = 'released'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM audit_legal_hold_events placed
+                      WHERE placed.organization_id = NEW.organization_id
+                        AND placed.hold_id = NEW.hold_id
+                        AND placed.target_type = NEW.target_type
+                        AND placed.target_id = NEW.target_id
+                        AND placed.event_type = 'placed'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM audit_legal_hold_events released
+                            WHERE released.organization_id = placed.organization_id
+                              AND released.hold_id = placed.hold_id
+                              AND released.event_type = 'released'
+                        )
+                  )
+                BEGIN
+                    SELECT RAISE(ABORT, 'cannot release an inactive audit legal hold');
+                END
+                """
+            )
+
     def init_schema(self) -> None:
         if self.backend == "postgres":
+            migrations_dir = (
+                Path(__file__).resolve().parent.parent.parent / "migrations"
+            )
             with self.transaction() as cur:
                 cur.execute("SELECT to_regclass('release_projections');")
                 res = cur.fetchone()
                 if not res or not res.get("to_regclass"):
-                    migration_file = (
-                        Path(__file__).resolve().parent.parent.parent
-                        / "migrations"
-                        / "001_initial_participation_schema.sql"
-                    )
-                    if migration_file.exists():
-                        cur.execute(migration_file.read_text(encoding="utf-8"))
-            # Tables added after the initial migration must exist in already
-            # provisioned databases too (the migration file only runs once).
+                    migration_file = migrations_dir / "001_initial_participation_schema.sql"
+                    if not migration_file.exists():
+                        raise FileNotFoundError(migration_file)
+                    cur.execute(migration_file.read_text(encoding="utf-8"))
+
+            # Ensure tenant-scoped tables exist in databases provisioned before
+            # these tables were added to the initial migration.
             self._ensure_postgres_tenant_tables()
+
+            # All post-baseline migrations run in order, including append-only
+            # audit retention (003). Skipping any of them here would leave the
+            # production backend without the guarantees its tests cover.
+            for migration_name in _POSTGRES_INCREMENTAL_MIGRATIONS:
+                migration_file = migrations_dir / migration_name
+                if not migration_file.exists():
+                    raise FileNotFoundError(migration_file)
+                with self.transaction() as cur:
+                    cur.execute(migration_file.read_text(encoding="utf-8"))
         else:
             with self.transaction() as cur:
                 cur.executescript(
@@ -527,6 +686,87 @@ class ParticipationDatabase:
                         attempts INTEGER NOT NULL DEFAULT 0
                     );
 
+                    CREATE TABLE IF NOT EXISTS outbox_deliveries (
+                        delivery_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        outbox_id TEXT NOT NULL REFERENCES outbox(id),
+                        message_id TEXT NOT NULL UNIQUE,
+                        domain_event_id TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        aggregate_type TEXT NOT NULL,
+                        aggregate_id TEXT NOT NULL,
+                        aggregate_version INTEGER NOT NULL,
+                        partition_key TEXT NOT NULL,
+                        envelope_json TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('pending', 'in_flight', 'published', 'dead_letter')
+                        ),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                        next_attempt_at TEXT NOT NULL,
+                        lease_token TEXT,
+                        lease_expires_at TEXT,
+                        last_error_code TEXT,
+                        replay_of_delivery_id TEXT REFERENCES outbox_deliveries(delivery_id),
+                        replay_request_hash TEXT,
+                        created_at TEXT NOT NULL,
+                        published_at TEXT,
+                        UNIQUE (organization_id, replay_request_hash)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_due
+                    ON outbox_deliveries (
+                        organization_id, state, next_attempt_at, lease_expires_at
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_domain_event
+                    ON outbox_deliveries (organization_id, domain_event_id);
+
+                    CREATE TABLE IF NOT EXISTS event_dead_letters (
+                        dead_letter_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        delivery_id TEXT NOT NULL UNIQUE
+                            REFERENCES outbox_deliveries(delivery_id),
+                        message_id TEXT NOT NULL,
+                        domain_event_id TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        error_code TEXT NOT NULL CHECK (
+                            error_code IN (
+                                'transport_unavailable', 'transport_timeout',
+                                'transport_rejected', 'invalid_envelope',
+                                'rate_limited', 'transport_error'
+                            )
+                        ),
+                        failed_at TEXT NOT NULL,
+                        replayed_at TEXT,
+                        replay_delivery_id TEXT REFERENCES outbox_deliveries(delivery_id)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_event_dead_letters_tenant
+                    ON event_dead_letters (organization_id, failed_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS event_gaps (
+                        gap_id TEXT PRIMARY KEY,
+                        organization_id TEXT NOT NULL,
+                        consumer_name TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        aggregate_id TEXT NOT NULL,
+                        expected_version INTEGER NOT NULL CHECK (expected_version > 0),
+                        observed_version INTEGER NOT NULL
+                            CHECK (observed_version > expected_version),
+                        detected_by_domain_event_id TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('open', 'resolved')),
+                        detected_at TEXT NOT NULL,
+                        resolved_at TEXT,
+                        UNIQUE (
+                            organization_id, consumer_name, aggregate_id, expected_version
+                        )
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_event_gaps_open
+                    ON event_gaps (organization_id, state, aggregate_id);
+
                     CREATE TABLE IF NOT EXISTS privacy_requests (
                         id TEXT PRIMARY KEY,
                         organization_id TEXT NOT NULL,
@@ -553,6 +793,7 @@ class ParticipationDatabase:
                     );
                     """
                 )
+            self._migrate_audit_logs_sqlite()
 
     def _ensure_postgres_tenant_tables(self) -> None:
         """Create tables that are not part of the initial migration, idempotently.
@@ -760,9 +1001,11 @@ class ParticipationDatabase:
             cur.execute("DELETE FROM ventures")
             cur.execute("DELETE FROM idempotency_keys")
             cur.execute("DELETE FROM inbox")
+            cur.execute("DELETE FROM event_dead_letters")
+            cur.execute("DELETE FROM outbox_deliveries")
+            cur.execute("DELETE FROM event_gaps")
             cur.execute("DELETE FROM outbox")
             cur.execute("DELETE FROM privacy_requests")
-            cur.execute("DELETE FROM audit_logs")
             cur.execute("DELETE FROM capacity_counters")
             cur.execute("DELETE FROM release_projections")
         self.seed_default_release(default_capacity=capacity)

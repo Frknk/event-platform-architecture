@@ -60,6 +60,7 @@ components:
       schema:
         type: string
         format: uuid
+      description: Participation genera un UUIDv7 por request, ignora cualquier X-Request-Id entrante y devuelve el ID generado.
 
   schemas:
     ProblemDetails:

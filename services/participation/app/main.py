@@ -5,8 +5,9 @@ Implements the canonical endpoints defined in contracts/API-CONTRACTS.md and TEA
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,14 +16,25 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.core.problem import ProblemException, create_problem_response
-from app.core.security import generate_uuidv7, security_manager
+from app.core.security import security_manager
 from app.db.database import (
     DEFAULT_EVENT_ID,
     DEFAULT_EVENT_SLUG,
+    DEFAULT_ORG_ID,
     DEFAULT_SITE_SLUG,
     ParticipationDatabase,
 )
+from app.services.audit_service import AuditContext, AuditResult, AuditService
+from app.services.abuse_protection import (
+    CHALLENGE_HEADER,
+    DEVICE_HEADER,
+    PROOF_HEADER,
+    AbuseProtection,
+)
 from app.services.participation_service import ParticipationService
+
+
+logger = logging.getLogger("participation.api")
 
 
 class AttendeeModel(BaseModel):
@@ -94,7 +106,6 @@ class ApplicationResubmitRequest(BaseModel):
 class RegistrationCorrectionRequest(BaseModel):
     reason: str = Field(..., min_length=3)
     updates: Dict[str, Any]
-    actor: Optional[str] = "manager"
 
 
 class ApplicationAdmissibilityDecisionRequest(BaseModel):
@@ -144,26 +155,161 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Request-Id", "ETag", "Cache-Control", "Retry-After"],
+        expose_headers=[
+            "X-Request-Id",
+            "ETag",
+            "Cache-Control",
+            "Retry-After",
+            "X-Participation-Device",
+        ],
     )
 
     db = ParticipationDatabase(db_path=db_path)
-    service = ParticipationService(db=db)
+    audit_service = AuditService()
+    abuse_protection = AbuseProtection.from_env()
+    service = ParticipationService(db=db, audit_service=audit_service)
     app.state.db = db
     app.state.service = service
+    app.state.audit_service = audit_service
+    app.state.abuse_protection = abuse_protection
+
+    def protection_response(
+        *,
+        request_id: str,
+        status_code: int,
+        code: str,
+        detail: str,
+        device_token: Optional[str] = None,
+        retry_after: Optional[int] = None,
+        challenge: Optional[dict[str, object]] = None,
+    ) -> JSONResponse:
+        body: dict[str, Any] = {
+            "type": f"https://errors.example.pe/{code.replace('_', '-')}",
+            "title": "Request protection required",
+            "status": status_code,
+            "code": code,
+            "detail": detail,
+            "request_id": request_id,
+        }
+        if challenge is not None:
+            body["challenge"] = challenge
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Request-Id": request_id,
+        }
+        if device_token:
+            headers[DEVICE_HEADER] = device_token
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
+        return JSONResponse(
+            status_code=status_code,
+            content=body,
+            media_type="application/problem+json",
+            headers=headers,
+        )
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
-        incoming_req_id = request.headers.get("X-Request-Id")
-        request_id = incoming_req_id if incoming_req_id and len(incoming_req_id) >= 8 else generate_uuidv7()
-        request.state.request_id = request_id
+        request_id = audit_service.assign_request_id(request)
+        if abuse_protection.protects(request.method, request.url.path):
+            peer_ip = request.client.host if request.client else "unknown"
+            event_match = abuse_protection.event_from_path(request.url.path)
+            device_token = request.headers.get(DEVICE_HEADER)
+            device_id = abuse_protection.verify_device_token(device_token)
+            issued_device_token = None
+            if device_id is None:
+                device_id, issued_device_token = abuse_protection.issue_device_token()
+
+            decision = abuse_protection.check_request(
+                peer_ip=peer_ip,
+                event_key=event_match,
+                device_id=device_id,
+            )
+            response_device_token = issued_device_token or device_token
+            if not decision.allowed:
+                return protection_response(
+                    request_id=request_id,
+                    status_code=429,
+                    code="rate_limit_exceeded",
+                    detail="Too many requests. Retry after the indicated delay.",
+                    device_token=response_device_token,
+                    retry_after=decision.retry_after,
+                )
+
+            if decision.challenge_required:
+                challenge_result = abuse_protection.verify_and_consume_challenge(
+                    token=request.headers.get(CHALLENGE_HEADER),
+                    proof=request.headers.get(PROOF_HEADER),
+                    peer_ip=peer_ip,
+                    event_key=event_match,
+                    device_id=device_id,
+                )
+                if challenge_result != "valid":
+                    abuse_protection.record_challenged()
+                    challenge = abuse_protection.issue_challenge(
+                        peer_ip=peer_ip,
+                        event_key=event_match,
+                        device_id=device_id,
+                    )
+                    return protection_response(
+                        request_id=request_id,
+                        status_code=428,
+                        code=challenge_result,
+                        detail="Solve the one-use proof-of-work challenge and retry this request.",
+                        device_token=response_device_token,
+                        challenge=challenge,
+                    )
+
         response: Response = await call_next(request)
         response.headers["X-Request-Id"] = request_id
+        if abuse_protection.protects(request.method, request.url.path):
+            if issued_device_token:
+                response.headers[DEVICE_HEADER] = issued_device_token
+            elif device_token:
+                response.headers[DEVICE_HEADER] = device_token
         return response
 
     @app.exception_handler(ProblemException)
     async def problem_exception_handler(request: Request, exc: ProblemException):
         return create_problem_response(request, exc)
+
+    def run_sensitive_operation(
+        request: Request,
+        *,
+        action: str,
+        target_type: str,
+        target_id: str,
+        operation: Callable[[AuditContext], Any],
+    ) -> Any:
+        context = audit_service.context_for_request(request)
+
+        def audit_outcome(result: AuditResult, payload: Optional[dict[str, Any]] = None) -> None:
+            # The business transaction is already gone at this point (rollback or
+            # unexpected error). Persist the outcome in its own transaction and
+            # never let an audit failure mask the original response.
+            try:
+                with db.transaction() as cur:
+                    audit_service.record(
+                        cur,
+                        context=context,
+                        organization_id=DEFAULT_ORG_ID,
+                        action=action,
+                        target_type=target_type,
+                        target_id=target_id,
+                        result=result,
+                        payload=payload,
+                    )
+            except Exception:
+                logger.exception("Could not persist %s audit for %s", result, action)
+
+        try:
+            return operation(context)
+        except ProblemException as exc:
+            audit_outcome("rejected", {"problem_code": exc.code})
+            raise
+        except Exception:
+            audit_outcome("failed")
+            raise
 
     # -------------------------------------------------------------------------
     # Public Endpoints (PA-A)
@@ -389,13 +535,20 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def correct_registration_admin(
         registration_id: str,
         body: RegistrationCorrectionRequest,
+        request: Request,
     ):
         """PA-031: Manager corrects allowlisted administrative fields with audit logging."""
-        return service.correct_registration_admin(
-            registration_id=registration_id,
-            reason=body.reason,
-            updates=body.updates,
-            actor=body.actor or "manager",
+        return run_sensitive_operation(
+            request,
+            action="correct_registration",
+            target_type="registration",
+            target_id=registration_id,
+            operation=lambda context: service.correct_registration_admin(
+                registration_id=registration_id,
+                reason=body.reason,
+                updates=body.updates,
+                audit_context=context,
+            ),
         )
 
     @app.get("/participation/v1/events/{event_id}/applications")
@@ -410,51 +563,83 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def admit_application(
         application_id: str,
         body: ApplicationAdmissibilityDecisionRequest,
+        request: Request,
     ):
         """PA-032: Reviewer evaluates and admits an application with checklist and reason."""
-        return service.admit_application(
-            application_id=application_id,
-            expected_revision=body.expected_revision,
-            reason=body.reason,
-            checklist=body.checklist,
+        return run_sensitive_operation(
+            request,
+            action="admit_application",
+            target_type="application",
+            target_id=application_id,
+            operation=lambda context: service.admit_application(
+                application_id=application_id,
+                expected_revision=body.expected_revision,
+                reason=body.reason,
+                checklist=body.checklist,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/applications/{application_id}/rejections")
     def reject_application(
         application_id: str,
         body: ApplicationAdmissibilityDecisionRequest,
+        request: Request,
     ):
         """PA-032: Reviewer evaluates and rejects an application with checklist and reason."""
-        return service.reject_application(
-            application_id=application_id,
-            expected_revision=body.expected_revision,
-            reason=body.reason,
-            checklist=body.checklist,
+        return run_sensitive_operation(
+            request,
+            action="reject_application",
+            target_type="application",
+            target_id=application_id,
+            operation=lambda context: service.reject_application(
+                application_id=application_id,
+                expected_revision=body.expected_revision,
+                reason=body.reason,
+                checklist=body.checklist,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/events/{event_id}/registration-imports")
     def import_registrations(
         event_id: str,
         body: RegistrationImportRequest,
+        request: Request,
     ):
         """PA-033: Controlled batch registration import with dry-run and capacity enforcement."""
-        return service.import_registrations(
-            event_id=event_id,
-            rows=body.rows,
-            legal_basis=body.legal_basis,
-            dry_run=body.dry_run,
+        return run_sensitive_operation(
+            request,
+            action="import_registrations",
+            target_type="event",
+            target_id=event_id,
+            operation=lambda context: service.import_registrations(
+                event_id=event_id,
+                rows=body.rows,
+                legal_basis=body.legal_basis,
+                dry_run=body.dry_run,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/privacy-requests")
     def execute_privacy_request(
         body: PrivacyRequestInput,
+        request: Request,
     ):
         """PA-034: ARCO Privacy request with Legal Hold blocking and zero-PII receipt."""
-        return service.execute_privacy_request(
-            email=body.email,
-            request_type=body.request_type,
-            legal_hold=body.legal_hold,
-            reason=body.reason,
+        return run_sensitive_operation(
+            request,
+            action="privacy_request",
+            target_type="privacy_request",
+            target_id=request.state.request_id,
+            operation=lambda context: service.execute_privacy_request(
+                email=body.email,
+                request_type=body.request_type,
+                legal_hold=body.legal_hold,
+                reason=body.reason,
+                audit_context=context,
+            ),
         )
 
     @app.post("/participation/v1/events/{event_id}/operations-projections")

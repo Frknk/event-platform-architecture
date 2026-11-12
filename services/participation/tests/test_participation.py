@@ -8,6 +8,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import json
 import tempfile
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.core.security import generate_uuidv7, security_manager
@@ -22,11 +23,23 @@ from app.db.database import (
 from app.main import create_app
 
 
-def _make_client() -> TestClient:
+def _make_client(*, raise_server_exceptions: bool = True) -> TestClient:
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     app = create_app(db_path=tmp.name)
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+
+
+def _audit_rows(client: TestClient, *, request_id: str | None = None) -> list[dict]:
+    with client.app.state.db.read_cursor() as cur:
+        if request_id:
+            cur.execute(
+                "SELECT * FROM audit_logs WHERE request_id = ? ORDER BY created_at, id",
+                (request_id,),
+            )
+        else:
+            cur.execute("SELECT * FROM audit_logs ORDER BY created_at, id")
+        return [dict(row) for row in cur.fetchall()]
 
 
 def _sample_registration_payload(email: str = "ana.torres@unas.edu.pe", name: str = "Ana Torres") -> dict:
@@ -589,6 +602,13 @@ def test_pa031_admin_correction_allowlisted_fields_and_audit():
     )
     assert bad_field_res.status_code == 400
     assert bad_field_res.json()["code"] == "field_not_correctable"
+    rejected_audit = _audit_rows(client, request_id=bad_field_res.headers["X-Request-Id"])
+    assert len(rejected_audit) == 1
+    assert rejected_audit[0]["action"] == "correct_registration"
+    assert rejected_audit[0]["result"] == "rejected"
+    assert json.loads(rejected_audit[0]["payload_json"]) == {
+        "problem_code": "field_not_correctable"
+    }
 
     # 2. Reject missing reason
     no_reason_res = client.patch(
@@ -609,11 +629,29 @@ def test_pa031_admin_correction_allowlisted_fields_and_audit():
             },
             "actor": "manager",
         },
+        headers={"X-Request-Id": "client-forged-request-id"},
     )
     assert good_corr.status_code == 200
+    assert good_corr.headers["X-Request-Id"] != "client-forged-request-id"
     corr_data = good_corr.json()
     assert corr_data["status"] == "corrected"
     assert corr_data["full_name_masked"] == "J*** P***"
+    correction_audit = _audit_rows(client, request_id=good_corr.headers["X-Request-Id"])
+    assert len(correction_audit) == 1
+    assert correction_audit[0]["result"] == "success"
+    assert correction_audit[0]["actor_type"] is None
+    assert correction_audit[0]["actor_id"] is None
+    assert correction_audit[0]["actor"] == "unattributed"
+    assert "juan.perez@unas.edu.pe" not in json.dumps(correction_audit)
+    assert "Juan Pérez" not in json.dumps(correction_audit)
+    assert "+51999888777" not in json.dumps(correction_audit)
+    assert (
+        correction_audit[0]["reason"]
+        == "Corrección de tilde en apellido y teléfono de contacto"
+    )
+    assert json.loads(correction_audit[0]["payload_json"]) == {
+        "updated_fields": ["full_name", "institution", "phone"]
+    }
 
     # Check reveal_pii=True returns decrypted corrected full_name
     search = client.get(
@@ -661,6 +699,10 @@ def test_pa032_admissibility_admission_and_rejection_with_optimistic_locking():
     )
     assert admit_res.status_code == 200
     assert admit_res.json()["state"] == "admitted"
+    admit_audit = _audit_rows(client, request_id=admit_res.headers["X-Request-Id"])
+    assert len(admit_audit) == 1
+    assert admit_audit[0]["action"] == "admit_application"
+    assert admit_audit[0]["result"] == "success"
 
     # Create and submit App 2
     app2_res = client.post(
@@ -684,6 +726,10 @@ def test_pa032_admissibility_admission_and_rejection_with_optimistic_locking():
         },
     )
     assert stale_res.status_code == 412
+    stale_audit = _audit_rows(client, request_id=stale_res.headers["X-Request-Id"])
+    assert len(stale_audit) == 1
+    assert stale_audit[0]["action"] == "reject_application"
+    assert stale_audit[0]["result"] == "rejected"
 
     # 3. Reject App 2 with correct expected revision
     rej_res = client.post(
@@ -699,6 +745,10 @@ def test_pa032_admissibility_admission_and_rejection_with_optimistic_locking():
     )
     assert rej_res.status_code == 200
     assert rej_res.json()["state"] == "rejected"
+    rejection_audit = _audit_rows(client, request_id=rej_res.headers["X-Request-Id"])
+    assert len(rejection_audit) == 1
+    assert rejection_audit[0]["action"] == "reject_application"
+    assert rejection_audit[0]["result"] == "success"
 
     # Verify listing shows both
     app_list = client.get(f"/participation/v1/events/{DEFAULT_EVENT_ID}/applications").json()["items"]
@@ -740,6 +790,7 @@ def test_pa033_batch_registration_import_dry_run_and_errors():
     assert dry_data["valid_count"] == 1
     assert dry_data["created_count"] == 0
     assert dry_data["error_count"] == 1
+    assert _audit_rows(client, request_id=dry_res.headers["X-Request-Id"]) == []
 
     # Database still has 0 registrations from import
     search = client.get(
@@ -762,6 +813,18 @@ def test_pa033_batch_registration_import_dry_run_and_errors():
     assert real_data["dry_run"] is False
     assert real_data["created_count"] == 1
     assert real_data["error_count"] == 1
+    import_audit = _audit_rows(client, request_id=real_res.headers["X-Request-Id"])
+    assert len(import_audit) == 1
+    assert import_audit[0]["action"] == "import_registrations"
+    assert import_audit[0]["result"] == "success"
+    assert import_audit[0]["reason"] == "Consentimiento firmado según Ley 29733"
+    assert json.loads(import_audit[0]["payload_json"]) == {
+        "created_count": 1,
+        "dry_run": False,
+        "error_count": 1,
+    }
+    assert "importado1@unas.edu.pe" not in json.dumps(import_audit)
+    assert "70112233" not in json.dumps(import_audit)
 
     # Registration exists now
     search_after = client.get(
@@ -795,6 +858,14 @@ def test_pa034_privacy_arco_erasure_legal_hold_and_zero_pii_receipt():
     )
     assert lh_res.status_code == 409
     assert lh_res.json()["code"] == "legal_hold_active"
+    legal_hold_audit = _audit_rows(client, request_id=lh_res.headers["X-Request-Id"])
+    assert len(legal_hold_audit) == 1
+    assert legal_hold_audit[0]["action"] == "privacy_request"
+    assert legal_hold_audit[0]["result"] == "rejected"
+    assert user_email not in json.dumps(legal_hold_audit)
+    with client.app.state.db.read_cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS count FROM audit_legal_hold_events")
+        assert cur.fetchone()["count"] == 0
 
     # 2. Erasure executed without Legal Hold -> Tombstone, ticket revoked, zero PII receipt
     erase_res = client.post(
@@ -810,6 +881,13 @@ def test_pa034_privacy_arco_erasure_legal_hold_and_zero_pii_receipt():
     assert receipt["status"] == "erased"
     assert "tombstone_hash" in receipt
     assert receipt["anonymized_count"] >= 1
+    erasure_audit = _audit_rows(client, request_id=erase_res.headers["X-Request-Id"])
+    assert len(erasure_audit) == 1
+    assert erasure_audit[0]["action"] == "privacy_request"
+    assert erasure_audit[0]["result"] == "success"
+    assert erasure_audit[0]["target_id"] == receipt["receipt_id"]
+    assert json.loads(erasure_audit[0]["payload_json"])["request_type"] == "erasure"
+    assert user_email not in json.dumps(erasure_audit)
     # Zero plaintext PII in receipt
     assert user_email not in json.dumps(receipt)
     assert "María" not in json.dumps(receipt)
@@ -817,6 +895,38 @@ def test_pa034_privacy_arco_erasure_legal_hold_and_zero_pii_receipt():
     # 3. Registration state in database is tombstoned/cancelled
     self_res = client.get(f"/participation/self/v1/registrations/{reg_id}")
     assert self_res.json()["state"] == "cancelled"
+
+
+def test_pa043_audit_insert_failure_rolls_back_sensitive_change():
+    client = _make_client(raise_server_exceptions=False)
+    reg_res = client.post(
+        f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/registrations",
+        json=_sample_registration_payload(email="atomic.audit@unas.edu.pe", name="Original Name"),
+        headers={"Idempotency-Key": f"atomic-audit-{generate_uuidv7()}"},
+    )
+    assert reg_res.status_code == 201
+    reg_id = reg_res.json()["id"]
+
+    with patch.object(
+        client.app.state.audit_service,
+        "record",
+        side_effect=RuntimeError("audit storage unavailable"),
+    ):
+        correction_res = client.patch(
+            f"/participation/v1/registrations/{reg_id}",
+            json={
+                "reason": "Must rollback if audit fails",
+                "updates": {"full_name": "Changed Name"},
+            },
+        )
+
+    assert correction_res.status_code == 500
+    registered = client.get(
+        f"/participation/v1/events/{DEFAULT_EVENT_ID}/registrations",
+        params={"email": "atomic.audit@unas.edu.pe", "reveal_pii": True},
+    ).json()["items"]
+    assert registered[0]["full_name"] == "Original Name"
+    assert _audit_rows(client) == []
 
 
 def test_pa035_purpose_bound_aes_gcm_operations_projection():
