@@ -57,15 +57,15 @@ class ParticipationService:
         self,
         cur: Any,
         *,
-        context: Optional[AuditContext],
+        context: AuditContext,
         organization_id: str,
         action: str,
         target_type: str,
         target_id: str,
         result: AuditResult,
+        reason: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if context is None:
-            return
         self.audit_service.record(
             cur,
             context=context,
@@ -74,6 +74,8 @@ class ParticipationService:
             target_type=target_type,
             target_id=target_id,
             result=result,
+            reason=reason,
+            payload=payload,
         )
 
     # -------------------------------------------------------------------------
@@ -346,6 +348,7 @@ class ParticipationService:
             )
 
         gap_detected: Optional[Dict[str, int]] = None
+        stale_version: Optional[Dict[str, int]] = None
         result: Optional[Dict[str, Any]] = None
         with self.db.transaction(org_id=org_id) as cur:
             if self.db.backend == "postgres":
@@ -419,6 +422,13 @@ class ParticipationService:
                     "expected_version": expected_version,
                     "observed_version": agg_version,
                 }
+            elif agg_version < expected_version:
+                # Late/duplicate version: record that it was received but never
+                # let an older snapshot overwrite a newer projection.
+                stale_version = {
+                    "expected_version": expected_version,
+                    "observed_version": agg_version,
+                }
             else:
                 now = utc_now_iso()
                 cur.execute(
@@ -465,6 +475,14 @@ class ParticipationService:
                     "waitlist_enabled": bool(waitlist_enabled),
                 }
 
+        if stale_version is not None:
+            return {
+                "status": "stale_ignored",
+                "domain_event_id": domain_event_id,
+                "event_id": event_id,
+                "expected_version": stale_version["expected_version"],
+                "observed_version": stale_version["observed_version"],
+            }
         if gap_detected is not None:
             raise ProblemException(
                 status=409,
@@ -1512,7 +1530,7 @@ class ParticipationService:
         registration_id: str,
         reason: str,
         updates: Dict[str, Any],
-        audit_context: Optional[AuditContext] = None,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-031: Manager corrects allowlisted admin fields without altering questionnaire answers or snapshot."""
         if not reason or len(reason.strip()) < 3:
@@ -1573,6 +1591,8 @@ class ParticipationService:
                 target_type="registration",
                 target_id=registration_id,
                 result="success",
+                reason=reason,
+                payload={"updated_fields": sorted(updates.keys())},
             )
 
             self._emit_outbox_event(
@@ -1587,11 +1607,7 @@ class ParticipationService:
                     "registration_id": registration_id,
                     "updated_fields": list(updates.keys()),
                     "reason": reason,
-                    "actor": (
-                        audit_context.actor_id
-                        if audit_context and audit_context.actor_id
-                        else "unattributed"
-                    ),
+                    "actor": audit_context.actor_id or "unattributed",
                     "corrected_at": now,
                 },
             )
@@ -1642,7 +1658,7 @@ class ParticipationService:
         expected_revision: int,
         reason: str,
         checklist: Optional[Dict[str, bool]] = None,
-        audit_context: Optional[AuditContext] = None,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-032: Reviewer admits application after validating admissibility checklist."""
         with self.db.transaction() as cur:
@@ -1673,6 +1689,8 @@ class ParticipationService:
                 target_type="application",
                 target_id=application_id,
                 result="success",
+                reason=reason,
+                payload={"checklist": checklist or {}},
             )
 
             self._emit_outbox_event(
@@ -1707,7 +1725,7 @@ class ParticipationService:
         expected_revision: int,
         reason: str,
         checklist: Optional[Dict[str, bool]] = None,
-        audit_context: Optional[AuditContext] = None,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-032: Reviewer rejects application with justification."""
         with self.db.transaction() as cur:
@@ -1738,6 +1756,8 @@ class ParticipationService:
                 target_type="application",
                 target_id=application_id,
                 result="success",
+                reason=reason,
+                payload={"checklist": checklist or {}},
             )
 
             self._emit_outbox_event(
@@ -1770,7 +1790,7 @@ class ParticipationService:
         rows: List[Dict[str, Any]],
         legal_basis: str,
         dry_run: bool = False,
-        audit_context: Optional[AuditContext] = None,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-033: Controlled batch/CSV registration import with dry-run, row-level errors and explicit legal basis."""
         if not legal_basis or len(legal_basis.strip()) < 3:
@@ -1940,16 +1960,21 @@ class ParticipationService:
                     detail="La capacidad del evento cambió durante la importación y ya no hay cupos suficientes.",
                 )
 
-            if imported_ids:
-                self._record_audit(
-                    cur,
-                    context=audit_context,
-                    organization_id=org_id,
-                    action="import_registrations",
-                    target_type="event",
-                    target_id=event_id,
-                    result="success",
-                )
+            self._record_audit(
+                cur,
+                context=audit_context,
+                organization_id=org_id,
+                action="import_registrations",
+                target_type="event",
+                target_id=event_id,
+                result="success",
+                reason=legal_basis,
+                payload={
+                    "created_count": len(imported_ids),
+                    "error_count": len(row_errors),
+                    "dry_run": False,
+                },
+            )
 
             self._emit_outbox_event(
                 cur,
@@ -1983,7 +2008,7 @@ class ParticipationService:
         request_type: str,
         legal_hold: bool = False,
         reason: Optional[str] = None,
-        audit_context: Optional[AuditContext] = None,
+        audit_context: AuditContext,
     ) -> Dict[str, Any]:
         """PA-034: ARCO Privacy Request handler with Legal Hold protection, erasure/tombstone and zero-PII cryptographic receipt."""
         clean_email = email.strip().lower()
@@ -2111,8 +2136,13 @@ class ParticipationService:
                     organization_id=org_id,
                     action="privacy_request",
                     target_type="privacy_request",
-                    target_id=audit_context.request_id if audit_context else req_id,
+                    target_id=req_id,
                     result="success",
+                    reason=reason or "privacy_erasure",
+                    payload={
+                        "request_type": "erasure",
+                        "registrations_anonymized": len(reg_ids),
+                    },
                 )
                 return evidence_payload
 
@@ -2168,8 +2198,13 @@ class ParticipationService:
                 organization_id=org_id,
                 action="privacy_request",
                 target_type="privacy_request",
-                target_id=audit_context.request_id if audit_context else req_id,
+                target_id=req_id,
                 result="success",
+                reason=reason or f"privacy_{request_type}",
+                payload={
+                    "request_type": request_type,
+                    "registrations_visible": len(regs),
+                },
             )
             return {
                 "receipt_id": req_id,

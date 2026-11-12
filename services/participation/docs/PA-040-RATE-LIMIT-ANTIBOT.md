@@ -22,6 +22,12 @@ This proof-of-work raises automated request cost; it is not a human CAPTCHA
 and cannot stop a sufficiently resourced bot. A risk policy requiring human
 verification needs a separately approved CAPTCHA/provider integration.
 
+The browser must run in a secure context (HTTPS or `localhost`) because the
+client solves the challenge with `crypto.subtle`. Serving the demo over plain
+HTTP from a LAN address disables that API, so clients would receive `428` and
+be unable to answer it until the sliding window expires. Use HTTPS/tunneling
+for remote demos, or keep the demo on `localhost`.
+
 ## Configuration
 
 Settings are read at process startup:
@@ -52,6 +58,13 @@ only this rate-limit/challenge check; it does not grant application
 permissions or bypass route authentication/authorization. No admin endpoint
 is provided to change it.
 
+Dimensions are evaluated in order: ip, event, then device. The first saturated
+dimension returns `429` immediately and no windows are allocated for the
+remaining dimensions, so a flood that is already blocked by ip cannot grow the
+tracked-key table with attacker-chosen event paths or discarded device tokens.
+The hard cap (50,000 tracked windows) remains as a last-resort backstop and
+returns `429` with `capacity` as the limited dimension.
+
 ## Operations, privacy, and limits
 
 The limiter, challenge signing key, replay tracking, and aggregate counters
@@ -62,6 +75,13 @@ configure the same `PARTICIPATION_ANTIBOT_SECRET` on every worker so signed
 tokens remain valid across workers. Challenge replay tracking remains local;
 a shared atomic store would be required for cluster-wide limits and strict
 cross-worker one-use enforcement, and is intentionally not added here.
+
+The device dimension is cooperative, not an identity: the first request
+without a valid token is counted against the device ID the server issues in
+that response, but a client that discards the header starts a new device key.
+This is equivalent to clearing a cookie. The IP/event dimensions remain the
+non-cooperative backstop; do not size the device limit as if it were
+unspoofable.
 
 The middleware uses the socket peer address. Behind a reverse proxy, configure
 the ASGI server to trust only the known proxy chain before deriving a client

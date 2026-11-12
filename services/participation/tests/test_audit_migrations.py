@@ -117,9 +117,13 @@ class SQLiteAuditMigrationTests(unittest.TestCase):
 
 class PostgreSQLAuditMigrationTests(unittest.TestCase):
     def _run_migration(self, *, existing_table: bool) -> None:
-        database_url = os.environ.get("PARTICIPATION_TEST_POSTGRES_URL")
+        database_url = os.environ.get("PARTICIPATION_TEST_POSTGRES_URL") or os.environ.get(
+            "TEST_DATABASE_URL"
+        )
         if not database_url:
-            self.skipTest("PARTICIPATION_TEST_POSTGRES_URL is not configured.")
+            self.skipTest(
+                "Set TEST_DATABASE_URL or PARTICIPATION_TEST_POSTGRES_URL to run PostgreSQL tests."
+            )
 
         try:
             import psycopg

@@ -39,6 +39,15 @@ DEFAULT_FORM_VERSION_ID = "0192f000-0000-7000-8000-000000000301"
 DEFAULT_CONSENT_VERSION = "consent-unas-v1.0"
 DEFAULT_POSTGRES_URL = "postgresql://participation_app:participation_local_secret@127.0.0.1:5434/participation_db"
 
+# Applied in order on every startup. Every migration in this list is
+# idempotent, so a database provisioned before a migration existed is repaired
+# instead of silently missing it.
+_POSTGRES_INCREMENTAL_MIGRATIONS = (
+    "002_audit_logs_enrichment.sql",
+    "003_audit_retention.sql",
+    "004_event_reconciliation.sql",
+)
+
 
 class PostgresRow(dict):
     """Dictionary subclass providing dict/sqlite3.Row compatible item access."""
@@ -381,33 +390,31 @@ class ParticipationDatabase:
 
     def init_schema(self) -> None:
         if self.backend == "postgres":
+            migrations_dir = (
+                Path(__file__).resolve().parent.parent.parent / "migrations"
+            )
             with self.transaction() as cur:
                 cur.execute("SELECT to_regclass('release_projections');")
                 res = cur.fetchone()
-                migrations_dir = (
-                    Path(__file__).resolve().parent.parent.parent / "migrations"
-                )
                 if not res or not res.get("to_regclass"):
                     migration_file = migrations_dir / "001_initial_participation_schema.sql"
-                    if migration_file.exists():
-                        cur.execute(migration_file.read_text(encoding="utf-8"))
-                    else:
+                    if not migration_file.exists():
                         raise FileNotFoundError(migration_file)
+                    cur.execute(migration_file.read_text(encoding="utf-8"))
 
             # Ensure tenant-scoped tables exist in databases provisioned before
             # these tables were added to the initial migration.
             self._ensure_postgres_tenant_tables()
 
-            audit_migration = migrations_dir / "002_audit_logs_enrichment.sql"
-            if not audit_migration.exists():
-                raise FileNotFoundError(audit_migration)
-            with self.transaction() as cur:
-                cur.execute(audit_migration.read_text(encoding="utf-8"))
-            reconciliation_migration = migrations_dir / "004_event_reconciliation.sql"
-            if not reconciliation_migration.exists():
-                raise FileNotFoundError(reconciliation_migration)
-            with self.transaction() as cur:
-                cur.execute(reconciliation_migration.read_text(encoding="utf-8"))
+            # All post-baseline migrations run in order, including append-only
+            # audit retention (003). Skipping any of them here would leave the
+            # production backend without the guarantees its tests cover.
+            for migration_name in _POSTGRES_INCREMENTAL_MIGRATIONS:
+                migration_file = migrations_dir / migration_name
+                if not migration_file.exists():
+                    raise FileNotFoundError(migration_file)
+                with self.transaction() as cur:
+                    cur.execute(migration_file.read_text(encoding="utf-8"))
         else:
             with self.transaction() as cur:
                 cur.executescript(

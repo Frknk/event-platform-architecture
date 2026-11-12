@@ -193,9 +193,13 @@ class SQLiteAuditRetentionTests(unittest.TestCase):
 
 class PostgreSQLAuditRetentionTests(unittest.TestCase):
     def test_migration_guards_uuid_and_text_target_ids(self) -> None:
-        database_url = os.environ.get("PARTICIPATION_TEST_POSTGRES_URL")
+        database_url = os.environ.get("PARTICIPATION_TEST_POSTGRES_URL") or os.environ.get(
+            "TEST_DATABASE_URL"
+        )
         if not database_url:
-            self.skipTest("PARTICIPATION_TEST_POSTGRES_URL is not configured.")
+            self.skipTest(
+                "Set TEST_DATABASE_URL or PARTICIPATION_TEST_POSTGRES_URL to run PostgreSQL tests."
+            )
 
         try:
             import psycopg

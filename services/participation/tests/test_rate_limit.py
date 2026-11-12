@@ -83,6 +83,24 @@ def test_ip_rate_limit_returns_429_and_retry_after_and_ignores_forwarded_ip(monk
     assert second.json()["code"] == "rate_limit_exceeded"
 
 
+def test_first_tokenless_request_is_counted_against_the_issued_device(monkeypatch):
+    client = _client(
+        monkeypatch,
+        PARTICIPATION_RATE_LIMIT_DEVICE_MAX=1,
+        PARTICIPATION_RATE_LIMIT_IP_MAX=100,
+        PARTICIPATION_RATE_LIMIT_EVENT_MAX=100,
+    )
+
+    first = _request(client)
+    assert first.status_code == 422
+    device = first.headers["X-Participation-Device"]
+    assert device
+
+    second = _request(client, {"X-Participation-Device": device})
+    assert second.status_code == 429
+    assert second.json()["code"] == "rate_limit_exceeded"
+
+
 def test_retry_after_matches_sliding_window_expiry():
     guard = AbuseProtection(
         RateLimitConfig(
@@ -146,6 +164,34 @@ def test_rate_limits_are_separately_enforced_for_event_and_signed_device():
     assert not device_limited.allowed
     assert device_limited.limited_dimensions == ("device",)
     assert device_guard.verify_device_token("client-chosen-device-id") is None
+
+
+def test_saturated_ip_does_not_create_windows_for_later_dimensions():
+    guard = AbuseProtection(
+        RateLimitConfig(
+            ip_limit=1,
+            event_limit=100,
+            device_limit=100,
+            ip_challenge_after=100,
+            event_challenge_after=100,
+            device_challenge_after=100,
+        )
+    )
+    with patch("app.services.abuse_protection.time.monotonic", return_value=100.0):
+        assert guard.check_request(
+            peer_ip="192.0.2.7", event_key="event-a", device_id="a" * 32
+        ).allowed
+        limited = guard.check_request(
+            peer_ip="192.0.2.7", event_key="event-b", device_id="b" * 32
+        )
+
+    assert limited.limited_dimensions == ("ip",)
+    # The rejected request must not allocate windows for the attacker-chosen
+    # event key or the discarded device token.
+    tracked = sorted(name for name, _ in guard._windows)
+    assert tracked == ["device", "event", "ip"]
+    assert ("event", guard._fingerprint("event", "event-b")) not in guard._windows
+    assert ("device", guard._fingerprint("device", "b" * 32)) not in guard._windows
 
 
 def test_concurrent_requests_cannot_exceed_limit():

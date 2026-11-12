@@ -43,6 +43,11 @@ class FailingTransport:
         raise TransportError(self.error_code, retryable=self.retryable)
 
 
+class TimeoutTransport:
+    def publish(self, envelope, *, headers):
+        raise TimeoutError("adapter deadline exceeded")
+
+
 class MutableClock:
     def __init__(self) -> None:
         self.current = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=5)
@@ -142,6 +147,41 @@ class EventDeliveryTests(unittest.TestCase):
         self.assertEqual(self._delivery()["attempts"], 1)
         self.assertIsNotNone(self._delivery()["published_at"])
         self.assertEqual(transport.messages[0][0]["message_id"], self.event["message_id"])
+
+    def test_corrupt_envelope_goes_to_dlq_without_poisoning_the_batch(self) -> None:
+        with self.db.transaction() as cur:
+            cur.execute(
+                "UPDATE outbox_deliveries SET envelope_json = ? WHERE delivery_id = ?",
+                ("{not-json", self.delivery_id),
+            )
+
+        transport = AcceptingTransport()
+        result = OutboxDeliveryService(self.db, transport).process_once(
+            organization_id=DEFAULT_ORG_ID
+        )
+
+        self.assertEqual(result["dead_lettered"], 1)
+        self.assertEqual(result["published"], 0)
+        self.assertEqual(transport.messages, [])
+        self.assertEqual(self._delivery()["state"], "dead_letter")
+        with self.db.read_cursor() as cur:
+            cur.execute(
+                "SELECT error_code FROM event_dead_letters WHERE delivery_id = ?",
+                (self.delivery_id,),
+            )
+            self.assertEqual(cur.fetchone()["error_code"], "invalid_envelope")
+
+    def test_unexpected_transport_exception_is_classified_and_retried(self) -> None:
+        result = OutboxDeliveryService(
+            self.db,
+            TimeoutTransport(),
+            jitter=lambda cap: 0.0,
+        ).process_once(organization_id=DEFAULT_ORG_ID)
+
+        self.assertEqual(result["retrying"], 1)
+        delivery = self._delivery()
+        self.assertEqual(delivery["state"], "pending")
+        self.assertEqual(delivery["last_error_code"], "transport_timeout")
 
     def test_existing_outbox_rows_are_not_assumed_delivered_or_requeued(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy.db"

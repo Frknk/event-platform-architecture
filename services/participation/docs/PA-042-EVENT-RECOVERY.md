@@ -71,6 +71,13 @@ error classification, and timestamps; it does not copy the event payload or
 exception text. The original outbox/delivery record remains available for
 investigation. Do not manually edit status or delete queue rows to recover.
 
+A row whose `envelope_json` cannot be parsed as a JSON object is terminal: it
+is dead-lettered as `invalid_envelope` without calling the transport. Adapter
+exceptions that are not `TransportError` are classified defensively
+(`TimeoutError` → `transport_timeout`, `ConnectionError`/`OSError` →
+`transport_unavailable`, anything else → `transport_error`) and retried, so a
+buggy adapter cannot strand the batch in `in_flight`.
+
 Inspect DLQ counts using the approved database access path with tenant context
 set. Correlate by `delivery_id`, `message_id`, and `error_code`; do not export
 envelopes or participant data to logs/tickets. Check adapter health and
@@ -94,6 +101,13 @@ does not fabricate missing event contents. Request replay from Team 2, deliver
 the missing version, then redeliver the rejected event. The gap is marked
 resolved when the expected version is processed. No gap is inferred from
 timestamps, UUID ordering, or `published_at`.
+
+When the received version is **lower** than the next expected version (a late
+redelivery, or a replay with a new `domain_event_id`), Participation records the
+inbox row for traceability but never applies it to the projection. It returns
+`{"status": "stale_ignored", "expected_version": ..., "observed_version": ...}`
+so the producer can stop retrying. This prevents an older manifest from
+overwriting a newer capacity/waitlist configuration.
 
 The demo release-ingest route is not an authenticated production consumer.
 Production acknowledgment/retry behavior requires the agreed inbound transport

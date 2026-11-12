@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Protocol
+import json
+from typing import Any, Literal, Mapping, Optional, Protocol
 
 from app.core.security import generate_uuidv7, utc_now_iso
 
 AuditResult = Literal["success", "rejected", "failed", "indeterminate"]
 ActorType = Literal["human", "service"]
 _AUDIT_RESULTS = {"success", "rejected", "failed", "indeterminate"}
+_MAX_REASON_LENGTH = 500
 _AUDIT_ACTIONS = {
     "correct_registration",
     "admit_application",
@@ -78,6 +80,8 @@ class AuditService:
         target_type: str,
         target_id: str,
         result: AuditResult,
+        reason: Optional[str] = None,
+        payload: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if result not in _AUDIT_RESULTS:
             raise ValueError(f"Unsupported audit result: {result}")
@@ -86,13 +90,22 @@ class AuditService:
         if not target_type or not target_id:
             raise ValueError("Audit target identifiers are required.")
 
+        reason_text = " ".join((reason or "not_recorded").split()) or "not_recorded"
+        if len(reason_text) > _MAX_REASON_LENGTH:
+            raise ValueError(f"Audit reason must be {_MAX_REASON_LENGTH} characters or fewer.")
+        payload_json = (
+            json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)
+            if payload is not None
+            else None
+        )
+
         cursor.execute(
             """
             INSERT INTO audit_logs (
                 id, organization_id, actor, action, target_type, target_id,
                 reason, payload_json, created_at, actor_type, actor_id, result,
                 request_id
-            ) VALUES (?, ?, ?, ?, ?, ?, 'not_recorded', NULL, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 generate_uuidv7(),
@@ -101,6 +114,8 @@ class AuditService:
                 action,
                 target_type,
                 target_id,
+                reason_text,
+                payload_json,
                 utc_now_iso(),
                 context.actor_type,
                 context.actor_id,

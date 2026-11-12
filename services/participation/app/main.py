@@ -5,6 +5,7 @@ Implements the canonical endpoints defined in contracts/API-CONTRACTS.md and TEA
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -23,7 +24,7 @@ from app.db.database import (
     DEFAULT_SITE_SLUG,
     ParticipationDatabase,
 )
-from app.services.audit_service import AuditContext, AuditService
+from app.services.audit_service import AuditContext, AuditResult, AuditService
 from app.services.abuse_protection import (
     CHALLENGE_HEADER,
     DEVICE_HEADER,
@@ -31,6 +32,9 @@ from app.services.abuse_protection import (
     AbuseProtection,
 )
 from app.services.participation_service import ParticipationService
+
+
+logger = logging.getLogger("participation.api")
 
 
 class AttendeeModel(BaseModel):
@@ -175,7 +179,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         status_code: int,
         code: str,
         detail: str,
-        device_token: str,
+        device_token: Optional[str] = None,
         retry_after: Optional[int] = None,
         challenge: Optional[dict[str, object]] = None,
     ) -> JSONResponse:
@@ -192,8 +196,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         headers = {
             "Cache-Control": "no-store",
             "X-Request-Id": request_id,
-            DEVICE_HEADER: device_token,
         }
+        if device_token:
+            headers[DEVICE_HEADER] = device_token
         if retry_after is not None:
             headers["Retry-After"] = str(retry_after)
         return JSONResponse(
@@ -218,13 +223,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             decision = abuse_protection.check_request(
                 peer_ip=peer_ip,
                 event_key=event_match,
-                device_id=(
-                    abuse_protection.verify_device_token(device_token)
-                    if device_token
-                    else None
-                ),
+                device_id=device_id,
             )
-            response_device_token = issued_device_token or device_token or ""
+            response_device_token = issued_device_token or device_token
             if not decision.allowed:
                 return protection_response(
                     request_id=request_id,
@@ -281,19 +282,33 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         operation: Callable[[AuditContext], Any],
     ) -> Any:
         context = audit_service.context_for_request(request)
+
+        def audit_outcome(result: AuditResult, payload: Optional[dict[str, Any]] = None) -> None:
+            # The business transaction is already gone at this point (rollback or
+            # unexpected error). Persist the outcome in its own transaction and
+            # never let an audit failure mask the original response.
+            try:
+                with db.transaction() as cur:
+                    audit_service.record(
+                        cur,
+                        context=context,
+                        organization_id=DEFAULT_ORG_ID,
+                        action=action,
+                        target_type=target_type,
+                        target_id=target_id,
+                        result=result,
+                        payload=payload,
+                    )
+            except Exception:
+                logger.exception("Could not persist %s audit for %s", result, action)
+
         try:
             return operation(context)
-        except ProblemException:
-            with db.transaction() as cur:
-                audit_service.record(
-                    cur,
-                    context=context,
-                    organization_id=DEFAULT_ORG_ID,
-                    action=action,
-                    target_type=target_type,
-                    target_id=target_id,
-                    result="rejected",
-                )
+        except ProblemException as exc:
+            audit_outcome("rejected", {"problem_code": exc.code})
+            raise
+        except Exception:
+            audit_outcome("failed")
             raise
 
     # -------------------------------------------------------------------------

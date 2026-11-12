@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -72,7 +73,7 @@ class AuditServiceTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.service.context_for_request(request)
 
-    def test_record_uses_minimal_fields_and_nulls_missing_actor(self) -> None:
+    def test_record_persists_normalized_reason_and_payload_without_actor(self) -> None:
         cursor = RecordingCursor()
         context = AuditContext("server-request-id", None, None)
 
@@ -88,6 +89,8 @@ class AuditServiceTests(unittest.TestCase):
                 target_type="registration",
                 target_id="0192f000-0000-7000-8000-000000000702",
                 result="success",
+                reason="  Corrección   de tilde ",
+                payload={"updated_fields": ["phone"], "count": 1},
             )
 
         normalized_query = " ".join(cursor.query.split())
@@ -98,10 +101,43 @@ class AuditServiceTests(unittest.TestCase):
             "registration",
             "0192f000-0000-7000-8000-000000000702",
         ))
-        self.assertEqual(cursor.params[6], "2026-11-10T00:00:00Z")
+        self.assertEqual(cursor.params[6], "Corrección de tilde")
+        self.assertEqual(
+            json.loads(cursor.params[7]),
+            {"count": 1, "updated_fields": ["phone"]},
+        )
+        self.assertEqual(cursor.params[8], "2026-11-10T00:00:00Z")
+        self.assertIsNone(cursor.params[9])
+        self.assertIsNone(cursor.params[10])
+        self.assertEqual(cursor.params[11:], ("success", "server-request-id"))
+
+    def test_record_defaults_reason_and_rejects_oversized_values(self) -> None:
+        context = AuditContext("server-request-id", None, None)
+        cursor = RecordingCursor()
+
+        self.service.record(
+            cursor,
+            context=context,
+            organization_id="0192f000-0000-7000-8000-000000000001",
+            action="privacy_request",
+            target_type="privacy_request",
+            target_id="0192f000-0000-7000-8000-000000000703",
+            result="success",
+        )
+        self.assertEqual(cursor.params[6], "not_recorded")
         self.assertIsNone(cursor.params[7])
-        self.assertIsNone(cursor.params[8])
-        self.assertEqual(cursor.params[9:], ("success", "server-request-id"))
+
+        with self.assertRaises(ValueError):
+            self.service.record(
+                cursor,
+                context=context,
+                organization_id="0192f000-0000-7000-8000-000000000001",
+                action="privacy_request",
+                target_type="privacy_request",
+                target_id="0192f000-0000-7000-8000-000000000703",
+                result="success",
+                reason="x" * 501,
+            )
 
 
 if __name__ == "__main__":

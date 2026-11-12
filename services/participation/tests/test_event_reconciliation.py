@@ -51,6 +51,14 @@ class EventReconciliationTests(unittest.TestCase):
             )
             return [row["aggregate_version"] for row in cur.fetchall()]
 
+    def _capacity(self) -> int:
+        with self.db.read_cursor() as cur:
+            cur.execute(
+                "SELECT capacity FROM capacity_counters WHERE event_id = ?",
+                (DEFAULT_EVENT_ID,),
+            )
+            return cur.fetchone()["capacity"]
+
     def test_release_sequence_gap_is_persisted_then_resolved_by_missing_version(self) -> None:
         first = self._envelope(1)
         self.assertEqual(self.service.ingest_release_published(first)["status"], "materialized")
@@ -79,6 +87,27 @@ class EventReconciliationTests(unittest.TestCase):
             resolved = cur.fetchone()
         self.assertEqual(resolved["state"], "resolved")
         self.assertIsNotNone(resolved["resolved_at"])
+
+    def test_late_event_never_overwrites_a_newer_projection(self) -> None:
+        newest = self._envelope(2)
+        newest["data"] = {"capacity": 12, "waitlist_enabled": True}
+        self.service.ingest_release_published(self._envelope(1))
+        self.service.ingest_release_published(newest)
+        self.assertEqual(self._capacity(), 12)
+
+        stale = self._envelope(1)
+        stale["data"] = {"capacity": 999, "waitlist_enabled": False}
+        result = self.service.ingest_release_published(stale)
+
+        self.assertEqual(result["status"], "stale_ignored")
+        self.assertEqual(result["expected_version"], 3)
+        self.assertEqual(result["observed_version"], 1)
+        self.assertEqual(self._capacity(), 12)
+        self.assertEqual(
+            self.service.ingest_release_published(stale)["status"],
+            "duplicate_ignored",
+        )
+        self.assertEqual(self._capacity(), 12)
 
     def test_concurrent_duplicate_event_is_applied_once(self) -> None:
         envelope = self._envelope(1)

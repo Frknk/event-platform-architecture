@@ -606,6 +606,9 @@ def test_pa031_admin_correction_allowlisted_fields_and_audit():
     assert len(rejected_audit) == 1
     assert rejected_audit[0]["action"] == "correct_registration"
     assert rejected_audit[0]["result"] == "rejected"
+    assert json.loads(rejected_audit[0]["payload_json"]) == {
+        "problem_code": "field_not_correctable"
+    }
 
     # 2. Reject missing reason
     no_reason_res = client.patch(
@@ -642,8 +645,13 @@ def test_pa031_admin_correction_allowlisted_fields_and_audit():
     assert "juan.perez@unas.edu.pe" not in json.dumps(correction_audit)
     assert "Juan Pérez" not in json.dumps(correction_audit)
     assert "+51999888777" not in json.dumps(correction_audit)
-    assert "Corrección de tilde" not in json.dumps(correction_audit)
-    assert correction_audit[0]["payload_json"] is None
+    assert (
+        correction_audit[0]["reason"]
+        == "Corrección de tilde en apellido y teléfono de contacto"
+    )
+    assert json.loads(correction_audit[0]["payload_json"]) == {
+        "updated_fields": ["full_name", "institution", "phone"]
+    }
 
     # Check reveal_pii=True returns decrypted corrected full_name
     search = client.get(
@@ -809,6 +817,12 @@ def test_pa033_batch_registration_import_dry_run_and_errors():
     assert len(import_audit) == 1
     assert import_audit[0]["action"] == "import_registrations"
     assert import_audit[0]["result"] == "success"
+    assert import_audit[0]["reason"] == "Consentimiento firmado según Ley 29733"
+    assert json.loads(import_audit[0]["payload_json"]) == {
+        "created_count": 1,
+        "dry_run": False,
+        "error_count": 1,
+    }
     assert "importado1@unas.edu.pe" not in json.dumps(import_audit)
     assert "70112233" not in json.dumps(import_audit)
 
@@ -871,6 +885,8 @@ def test_pa034_privacy_arco_erasure_legal_hold_and_zero_pii_receipt():
     assert len(erasure_audit) == 1
     assert erasure_audit[0]["action"] == "privacy_request"
     assert erasure_audit[0]["result"] == "success"
+    assert erasure_audit[0]["target_id"] == receipt["receipt_id"]
+    assert json.loads(erasure_audit[0]["payload_json"])["request_type"] == "erasure"
     assert user_email not in json.dumps(erasure_audit)
     # Zero plaintext PII in receipt
     assert user_email not in json.dumps(receipt)

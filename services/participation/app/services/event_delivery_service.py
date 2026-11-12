@@ -102,7 +102,23 @@ class OutboxDeliveryService:
         claimed = self._claim_due(organization_id=organization_id, limit=limit)
         result = {"claimed": len(claimed), "published": 0, "retrying": 0, "dead_lettered": 0}
         for delivery in claimed:
-            envelope = json.loads(delivery["envelope_json"])
+            try:
+                envelope = json.loads(delivery["envelope_json"])
+                if not isinstance(envelope, dict):
+                    raise ValueError("Envelope must be a JSON object.")
+            except (TypeError, ValueError):
+                # A corrupt row must never poison the whole batch: it is
+                # terminal, so route it to the DLQ with its classified reason.
+                self._record_failure(
+                    delivery=delivery,
+                    organization_id=organization_id,
+                    error_code="invalid_envelope",
+                    retryable=False,
+                    failed_at=self.clock(),
+                )
+                result["dead_lettered"] += 1
+                continue
+
             sent_at = self.clock()
             envelope["message_id"] = delivery["message_id"]
             envelope["published_at"] = _format_timestamp(sent_at)
@@ -126,7 +142,31 @@ class OutboxDeliveryService:
                     retryable=err.retryable,
                     failed_at=sent_at,
                 )
-                result["dead_lettered" if state == "dead_letter" else "retrying"] += 1
+            except TimeoutError:
+                state = self._record_failure(
+                    delivery=delivery,
+                    organization_id=organization_id,
+                    error_code="transport_timeout",
+                    retryable=True,
+                    failed_at=sent_at,
+                )
+            except (ConnectionError, OSError):
+                state = self._record_failure(
+                    delivery=delivery,
+                    organization_id=organization_id,
+                    error_code="transport_unavailable",
+                    retryable=True,
+                    failed_at=sent_at,
+                )
+            except Exception:
+                # A buggy adapter must not strand the batch in `in_flight`.
+                state = self._record_failure(
+                    delivery=delivery,
+                    organization_id=organization_id,
+                    error_code="transport_error",
+                    retryable=True,
+                    failed_at=sent_at,
+                )
             else:
                 self._record_success(
                     delivery=delivery,
@@ -135,6 +175,8 @@ class OutboxDeliveryService:
                     published_at=sent_at,
                 )
                 result["published"] += 1
+                continue
+            result["dead_lettered" if state == "dead_letter" else "retrying"] += 1
         return result
 
     def _claim_due(self, *, organization_id: str, limit: int) -> list[dict[str, Any]]:
@@ -288,10 +330,11 @@ class OutboxDeliveryService:
                 if cur.rowcount != 1:
                     raise RuntimeError("Delivery lease was lost before retry was recorded.")
                 state = "pending"
-            cur.execute(
-                "UPDATE outbox SET attempts = ? WHERE id = ?",
-                (delivery["attempts"], delivery["outbox_id"]),
-            )
+            if not delivery["replay_of_delivery_id"]:
+                cur.execute(
+                    "UPDATE outbox SET attempts = ? WHERE id = ?",
+                    (delivery["attempts"], delivery["outbox_id"]),
+                )
         return "dead_letter" if state == "dead_letter" else "pending"
 
     def replay_dead_letter(
@@ -408,6 +451,8 @@ class OutboxDeliveryService:
                 target_type="event_delivery",
                 target_id=delivery_id,
                 result="success",
+                reason="operator_replay",
+                payload={"replay_delivery_id": new_delivery_id},
             )
         return {
             "delivery_id": new_delivery_id,

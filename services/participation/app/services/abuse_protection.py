@@ -196,48 +196,48 @@ class AbuseProtection:
         now = time.monotonic()
         with self._lock:
             self._cleanup(now)
-            keys: list[tuple[str, str, int, int, deque[float]]] = []
+            keys: list[tuple[str, int, int, deque[float]]] = []
+            # Dimensions are evaluated in order (ip, event, device) and the
+            # first saturated one returns immediately, before the remaining
+            # windows are created. A tokenless flood always saturates the ip
+            # dimension first, so it can no longer grow ``_windows`` with
+            # attacker-controlled event keys or discarded device tokens until
+            # the global capacity cap (which would 429 every client) trips.
             for name, value, limit, challenge_after in dimensions:
                 key = (name, self._fingerprint(name, value))
-                timestamps = self._windows.setdefault(key, deque())
+                timestamps = self._windows.get(key)
+                if timestamps is None:
+                    timestamps = deque()
+                    self._windows[key] = timestamps
+                    if len(self._windows) > _MAX_TRACKED_KEYS:
+                        self._cleanup(now, force=True)
+                        if len(self._windows) > _MAX_TRACKED_KEYS:
+                            self._metrics[("limited", "capacity")] += 1
+                            return RateLimitDecision(
+                                allowed=False,
+                                retry_after=self.config.window_seconds,
+                                limited_dimensions=("capacity",),
+                            )
                 while timestamps and timestamps[0] <= now - self.config.window_seconds:
                     timestamps.popleft()
-                keys.append((name, key[1], limit, challenge_after, timestamps))
-
-            if len(self._windows) > _MAX_TRACKED_KEYS:
-                self._cleanup(now, force=True)
-                if len(self._windows) > _MAX_TRACKED_KEYS:
-                    self._metrics[("limited", "capacity")] += 1
+                if len(timestamps) >= limit:
+                    self._metrics[("limited", name)] += 1
                     return RateLimitDecision(
                         allowed=False,
-                        retry_after=self.config.window_seconds,
-                        limited_dimensions=("capacity",),
+                        retry_after=max(
+                            1,
+                            int(timestamps[0] + self.config.window_seconds - now + 0.999),
+                        ),
+                        limited_dimensions=(name,),
                     )
+                keys.append((name, limit, challenge_after, timestamps))
 
-            saturated = [entry for entry in keys if len(entry[4]) >= entry[2]]
-            if saturated:
-                retry_after = max(
-                    1,
-                    max(
-                        int(entry[4][0] + self.config.window_seconds - now + 0.999)
-                        for entry in saturated
-                    ),
-                )
-                limited_dimensions = tuple(sorted({entry[0] for entry in saturated}))
-                for dimension in limited_dimensions:
-                    self._metrics[("limited", dimension)] += 1
-                return RateLimitDecision(
-                    allowed=False,
-                    retry_after=retry_after,
-                    limited_dimensions=limited_dimensions,
-                )
-
-            for _, _, _, _, timestamps in keys:
+            for _, _, _, timestamps in keys:
                 timestamps.append(now)
             suspicious = [
-                entry[0]
-                for entry in keys
-                if len(entry[4]) > entry[3]
+                name
+                for name, _, challenge_after, timestamps in keys
+                if len(timestamps) > challenge_after
             ]
             challenge_required = bool(suspicious)
             if not challenge_required:

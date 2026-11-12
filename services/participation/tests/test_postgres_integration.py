@@ -2,11 +2,14 @@
 
 They are skipped unless a PostgreSQL URL is provided, e.g.:
 
-    TEST_DATABASE_URL=postgresql://participation_app:participation_local_secret@127.0.0.1:5434/participation_db \
+    TEST_DATABASE_URL=postgresql://...@127.0.0.1:5434/participation_test \
         pytest tests/test_postgres_integration.py
 
 The database must exist but can be empty: ``create_app`` applies the initial
-migration and the post-migration tables on startup.
+migration and the post-migration tables on startup. Its name must end in
+``_test`` because the suite resets demo state. The RLS isolation test requires
+a non-superuser role without ``BYPASSRLS``; with the docker-compose superuser
+that specific test skips (superusers always bypass row-level security).
 """
 
 from __future__ import annotations
@@ -28,11 +31,13 @@ from app.services.event_delivery_service import (
     TransportError,
 )
 
-PG_URL = os.environ.get("TEST_DATABASE_URL") or ""
+PG_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get(
+    "PARTICIPATION_TEST_POSTGRES_URL"
+) or ""
 
 pytestmark = pytest.mark.skipif(
     not PG_URL.startswith(("postgres://", "postgresql://")),
-    reason="TEST_DATABASE_URL (postgres) is not configured",
+    reason="Set TEST_DATABASE_URL or PARTICIPATION_TEST_POSTGRES_URL (postgres) to run these tests",
 )
 
 
@@ -61,6 +66,39 @@ def client():
     reset = test_client.post("/participation/v1/demo/reset", json={"capacity": 5})
     assert reset.status_code == 200, reset.text
     return test_client
+
+
+def test_pg_startup_applies_audit_retention_migration(client):
+    db = client.app.state.db
+    with db.read_cursor() as cur:
+        cur.execute("SELECT to_regclass('audit_legal_hold_events') AS name")
+        assert cur.fetchone()["name"] == "audit_legal_hold_events"
+        cur.execute(
+            """
+            SELECT tgname FROM pg_trigger
+            WHERE tgrelid = 'audit_logs'::regclass AND NOT tgisinternal
+            """
+        )
+        triggers = {row["tgname"] for row in cur.fetchall()}
+    assert {"audit_logs_append_only", "audit_logs_no_truncate"} <= triggers
+
+
+def test_pg_rls_isolates_tenants_for_restricted_role(client):
+    db = client.app.state.db
+    with db.read_cursor() as cur:
+        cur.execute(
+            "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+        )
+        role = cur.fetchone()
+    if role["rolsuper"] or role["rolbypassrls"]:
+        pytest.skip(
+            "RLS enforcement requires a non-superuser role without BYPASSRLS; "
+            "the docker-compose role is a superuser."
+        )
+
+    with db.read_cursor(org_id="0192f000-0000-0000-8000-000000000099") as cur:
+        cur.execute("SELECT COUNT(*) AS count FROM outbox_deliveries")
+        assert cur.fetchone()["count"] == 0
 
 
 def _registration_payload(email: str) -> dict:
@@ -224,7 +262,8 @@ def test_pg_audit_insert_failure_rolls_back_admin_correction(client):
         )
 
     assert correction.status_code == 500
-    record_audit.assert_called_once()
+    attempted_results = [call.kwargs["result"] for call in record_audit.call_args_list]
+    assert attempted_results == ["success", "failed"]
 
     with db.read_cursor() as cur:
         cur.execute(
@@ -319,20 +358,6 @@ def test_pg_outbox_delivery_dlq_replay_and_gap_reconciliation(client):
             (dead_delivery_id,),
         )
         assert cur.fetchone()["count"] == 1
-        cur.execute(
-            """
-            SELECT r.rolsuper, r.rolbypassrls
-            FROM pg_roles r WHERE r.rolname = current_user
-            """
-        )
-        role = cur.fetchone()
-        assert not role["rolsuper"]
-        assert not role["rolbypassrls"]
-
-    other_tenant = "0192f000-0000-0000-8000-000000000099"
-    with db.read_cursor(org_id=other_tenant) as cur:
-        cur.execute("SELECT COUNT(*) AS count FROM outbox_deliveries")
-        assert cur.fetchone()["count"] == 0
 
     def release_envelope(version: int) -> dict:
         return {
