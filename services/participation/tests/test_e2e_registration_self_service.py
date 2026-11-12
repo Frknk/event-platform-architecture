@@ -24,9 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
-from typing import Any, Dict, Generator
+from typing import Any, Dict
 import uuid
 
 import pytest
@@ -42,26 +40,12 @@ from app.db.database import (
     DEFAULT_PUBLICATION_ID,
     DEFAULT_SITE_SLUG,
 )
-from app.main import create_app
 from app.services.abuse_protection import DEVICE_HEADER
 
 
 # =============================================================================
-# Test Fixtures & Helpers
+# Test Helpers (client fixture provided by tests/conftest.py)
 # =============================================================================
-
-@pytest.fixture
-def client() -> Generator[TestClient, None, None]:
-    """Provide a TestClient backed by an isolated temporary SQLite database."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        db_path = tmp.name
-    app = create_app(db_path=db_path)
-    with TestClient(app, raise_server_exceptions=False) as test_client:
-        yield test_client
-    try:
-        os.remove(db_path)
-    except OSError:
-        pass
 
 
 def _sample_payload(

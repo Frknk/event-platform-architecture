@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
-import tempfile
 import uuid
 import pytest
 from fastapi.testclient import TestClient
@@ -36,14 +35,6 @@ from app.db.database import (
     DEFAULT_ORG_ID,
     DEFAULT_SITE_SLUG,
 )
-from app.main import create_app
-
-
-def _make_client(*, raise_server_exceptions: bool = True) -> TestClient:
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.close()
-    app = create_app(db_path=tmp.name)
-    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def _sample_venture_payload(
@@ -97,8 +88,7 @@ def _get_outbox_events(client: TestClient) -> list[dict]:
 # 1. POST /participation/public/v1/sites/{site}/events/{event}/applications
 # =============================================================================
 
-def test_create_venture_application_success():
-    client = _make_client()
+def test_create_venture_application_success(client: TestClient):
     payload = _sample_venture_payload(
         leader_email="carla.sanchez@unas.edu.pe",
         leader_name="Carla Sanchez",
@@ -138,8 +128,7 @@ def test_create_venture_application_success():
     assert len(inv_events) == 2
 
 
-def test_create_venture_application_idempotency_same_payload():
-    client = _make_client()
+def test_create_venture_application_idempotency_same_payload(client: TestClient):
     payload = _sample_venture_payload()
     idem_key = f"idem-create-{generate_uuidv7()}"
 
@@ -163,8 +152,7 @@ def test_create_venture_application_idempotency_same_payload():
     assert res2.json()["venture_id"] == data1["venture_id"]
 
 
-def test_create_venture_application_idempotency_payload_mismatch():
-    client = _make_client()
+def test_create_venture_application_idempotency_payload_mismatch(client: TestClient):
     payload = _sample_venture_payload()
     idem_key = f"idem-mismatch-{generate_uuidv7()}"
 
@@ -188,8 +176,7 @@ def test_create_venture_application_idempotency_payload_mismatch():
     assert r2.json()["code"] == "idempotency_key_reused"
 
 
-def test_create_venture_application_missing_idempotency_header():
-    client = _make_client()
+def test_create_venture_application_missing_idempotency_header(client: TestClient):
     payload = _sample_venture_payload()
 
     # Missing Idempotency-Key header returns 422
@@ -200,8 +187,7 @@ def test_create_venture_application_missing_idempotency_header():
     assert res.status_code == 422
 
 
-def test_create_venture_application_with_empty_member_email_and_defaults():
-    client = _make_client()
+def test_create_venture_application_with_empty_member_email_and_defaults(client: TestClient):
     payload = _sample_venture_payload(
         members=[
             {"email": "", "role": "member"},  # Empty email should be skipped
@@ -220,8 +206,7 @@ def test_create_venture_application_with_empty_member_email_and_defaults():
     assert body["invitations"][0]["email_masked"] == "v***b@unas.edu.pe"
 
 
-def test_create_venture_application_validation_missing_fields():
-    client = _make_client()
+def test_create_venture_application_validation_missing_fields(client: TestClient):
     idem_key = f"val-err-{generate_uuidv7()}"
 
     # Missing venture_name and leader
@@ -238,8 +223,7 @@ def test_create_venture_application_validation_missing_fields():
 # 3. PATCH /participation/self/v1/applications/{application_id}
 # =============================================================================
 
-def test_get_application_draft_details_and_etag():
-    client = _make_client()
+def test_get_application_draft_details_and_etag(client: TestClient):
     payload = _sample_venture_payload(leader_email="lucia.ramos@unas.edu.pe")
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -269,16 +253,14 @@ def test_get_application_draft_details_and_etag():
     assert body["revisions"] == []
 
 
-def test_get_application_not_found():
-    client = _make_client()
+def test_get_application_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.get(f"/participation/self/v1/applications/{fake_id}")
     assert res.status_code == 404
     assert res.json()["code"] == "tenant_forbidden"
 
 
-def test_patch_application_draft_expected_revision_success():
-    client = _make_client()
+def test_patch_application_draft_expected_revision_success(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -312,8 +294,7 @@ def test_patch_application_draft_expected_revision_success():
     assert get_res.json()["revision"] == 2
 
 
-def test_patch_application_draft_using_if_match_header():
-    client = _make_client()
+def test_patch_application_draft_using_if_match_header(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -339,8 +320,7 @@ def test_patch_application_draft_using_if_match_header():
     assert patch_res.headers["ETag"] == 'W/"3"'
 
 
-def test_patch_application_draft_stale_revision_conflict():
-    client = _make_client()
+def test_patch_application_draft_stale_revision_conflict(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -358,8 +338,7 @@ def test_patch_application_draft_stale_revision_conflict():
     assert stale_res.json()["code"] == "stale_revision"
 
 
-def test_patch_application_draft_not_found():
-    client = _make_client()
+def test_patch_application_draft_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.patch(
         f"/participation/self/v1/applications/{fake_id}",
@@ -369,8 +348,7 @@ def test_patch_application_draft_not_found():
     assert res.json()["code"] == "tenant_forbidden"
 
 
-def test_patch_application_cannot_edit_when_submitted():
-    client = _make_client()
+def test_patch_application_cannot_edit_when_submitted(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -404,8 +382,7 @@ def test_patch_application_cannot_edit_when_submitted():
 # 8. POST /participation/self/v1/ventures/{venture_id}/members/{member_id}/leave
 # =============================================================================
 
-def test_get_venture_details_success():
-    client = _make_client()
+def test_get_venture_details_success(client: TestClient):
     payload = _sample_venture_payload(venture_name="AquaAmazonas", track="Acuicultura")
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -426,16 +403,14 @@ def test_get_venture_details_success():
     assert len(v_data["invitations"]) == 2
 
 
-def test_get_venture_details_not_found():
-    client = _make_client()
+def test_get_venture_details_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.get(f"/participation/self/v1/ventures/{fake_id}")
     assert res.status_code == 404
     assert res.json()["code"] == "tenant_forbidden"
 
 
-def test_invite_team_member_success_and_idempotency():
-    client = _make_client()
+def test_invite_team_member_success_and_idempotency(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -468,8 +443,7 @@ def test_invite_team_member_success_and_idempotency():
     assert replay_res.json()["invitation_id"] == inv_data["invitation_id"]
 
 
-def test_invite_team_member_duplicate_pending():
-    client = _make_client()
+def test_invite_team_member_duplicate_pending(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -487,8 +461,7 @@ def test_invite_team_member_duplicate_pending():
     assert dup_res.json()["code"] == "invitation_already_pending"
 
 
-def test_invite_team_member_already_active_member():
-    client = _make_client()
+def test_invite_team_member_already_active_member(client: TestClient):
     leader_email = "lider.unico@unas.edu.pe"
     payload = _sample_venture_payload(leader_email=leader_email)
     res = client.post(
@@ -507,8 +480,7 @@ def test_invite_team_member_already_active_member():
     assert dup_act.json()["code"] == "already_team_member"
 
 
-def test_invite_team_member_validation_errors():
-    client = _make_client()
+def test_invite_team_member_validation_errors(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -542,8 +514,7 @@ def test_invite_team_member_validation_errors():
     assert v_unknown.status_code == 404
 
 
-def test_accept_invitation_success_and_duplicates():
-    client = _make_client()
+def test_accept_invitation_success_and_duplicates(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -574,15 +545,13 @@ def test_accept_invitation_success_and_duplicates():
     assert len(active_mems) == 2  # leader + accepted co-founder
 
 
-def test_accept_invitation_invalid_token():
-    client = _make_client()
+def test_accept_invitation_invalid_token(client: TestClient):
     res = client.post("/participation/public/v1/team-invitations/token_ficticio_12345/acceptance")
     assert res.status_code == 404
     assert res.json()["code"] == "invitation_not_found"
 
 
-def test_accept_invitation_expired():
-    client = _make_client()
+def test_accept_invitation_expired(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -602,8 +571,7 @@ def test_accept_invitation_expired():
     assert exp_res.json()["code"] == "invitation_expired"
 
 
-def test_decline_invitation_success_and_duplicates():
-    client = _make_client()
+def test_decline_invitation_success_and_duplicates(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -628,15 +596,13 @@ def test_decline_invitation_success_and_duplicates():
     assert dup_dec.json()["code"] == "invitation_already_processed"
 
 
-def test_decline_invitation_invalid_token():
-    client = _make_client()
+def test_decline_invitation_invalid_token(client: TestClient):
     res = client.post("/participation/public/v1/team-invitations/token_no_existe/declination")
     assert res.status_code == 404
     assert res.json()["code"] == "invitation_not_found"
 
 
-def test_member_leaves_venture_success_and_sole_leader_protection():
-    client = _make_client()
+def test_member_leaves_venture_success_and_sole_leader_protection(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -670,8 +636,7 @@ def test_member_leaves_venture_success_and_sole_leader_protection():
     assert sole_leave.json()["code"] == "cannot_remove_sole_leader"
 
 
-def test_leader_can_leave_if_co_leader_exists():
-    client = _make_client()
+def test_leader_can_leave_if_co_leader_exists(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -702,8 +667,7 @@ def test_leader_can_leave_if_co_leader_exists():
     assert leave_ok.json()["status"] == "left"
 
 
-def test_leave_venture_member_not_found():
-    client = _make_client()
+def test_leave_venture_member_not_found(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -723,8 +687,7 @@ def test_leave_venture_member_not_found():
 # 10. GET /participation/self/v1/applications/{application_id}/files
 # =============================================================================
 
-def test_upload_file_clean_pdf_ready_and_list_files():
-    client = _make_client()
+def test_upload_file_clean_pdf_ready_and_list_files(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -774,8 +737,7 @@ def test_upload_file_clean_pdf_ready_and_list_files():
     assert "demo_prototipo.mp4" in names
 
 
-def test_upload_suspicious_file_quarantined():
-    client = _make_client()
+def test_upload_suspicious_file_quarantined(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -811,8 +773,7 @@ def test_upload_suspicious_file_quarantined():
     assert f_exe.json()["state"] == "quarantined"
 
 
-def test_upload_file_too_large():
-    client = _make_client()
+def test_upload_file_too_large(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -835,8 +796,7 @@ def test_upload_file_too_large():
     assert res_large.json()["code"] == "file_too_large"
 
 
-def test_upload_file_non_existent_application():
-    client = _make_client()
+def test_upload_file_non_existent_application(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.post(
         f"/participation/self/v1/applications/{fake_id}/file-uploads",
@@ -851,8 +811,7 @@ def test_upload_file_non_existent_application():
     assert res.json()["code"] == "tenant_forbidden"
 
 
-def test_upload_file_blocked_when_application_submitted():
-    client = _make_client()
+def test_upload_file_blocked_when_application_submitted(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -886,8 +845,7 @@ def test_upload_file_blocked_when_application_submitted():
 # 11. POST /participation/self/v1/applications/{application_id}/submissions
 # =============================================================================
 
-def test_submit_application_success():
-    client = _make_client()
+def test_submit_application_success(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -930,8 +888,7 @@ def test_submit_application_success():
     assert sub_events[0]["data"]["snapshot_hash"] == s_data["snapshot_hash"]
 
 
-def test_submit_application_idempotency():
-    client = _make_client()
+def test_submit_application_idempotency(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -960,8 +917,7 @@ def test_submit_application_idempotency():
     assert sub2.json()["snapshot_hash"] == data1["snapshot_hash"]
 
 
-def test_submit_application_stale_revision():
-    client = _make_client()
+def test_submit_application_stale_revision(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -980,8 +936,7 @@ def test_submit_application_stale_revision():
     assert sub.json()["code"] == "stale_revision"
 
 
-def test_submit_application_blocked_by_quarantined_files():
-    client = _make_client()
+def test_submit_application_blocked_by_quarantined_files(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1011,8 +966,7 @@ def test_submit_application_blocked_by_quarantined_files():
     assert sub.json()["code"] == "files_not_ready"
 
 
-def test_submit_application_blocked_without_active_leader():
-    client = _make_client()
+def test_submit_application_blocked_without_active_leader(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1036,8 +990,7 @@ def test_submit_application_blocked_without_active_leader():
     assert sub.json()["code"] == "no_active_leader"
 
 
-def test_submit_application_invalid_state_transition():
-    client = _make_client()
+def test_submit_application_invalid_state_transition(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1064,8 +1017,7 @@ def test_submit_application_invalid_state_transition():
     assert sub2.json()["code"] == "invalid_state_transition"
 
 
-def test_submit_application_not_found():
-    client = _make_client()
+def test_submit_application_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     sub = client.post(
         f"/participation/self/v1/applications/{fake_id}/submissions",
@@ -1080,8 +1032,7 @@ def test_submit_application_not_found():
 # 12. POST /participation/self/v1/applications/{application_id}/withdrawals
 # =============================================================================
 
-def test_withdraw_application_success():
-    client = _make_client()
+def test_withdraw_application_success(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1115,8 +1066,7 @@ def test_withdraw_application_success():
     assert len(w_events) >= 1
 
 
-def test_withdraw_application_terminal_state_conflict():
-    client = _make_client()
+def test_withdraw_application_terminal_state_conflict(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1141,8 +1091,7 @@ def test_withdraw_application_terminal_state_conflict():
     assert w2.json()["code"] == "invalid_state_transition"
 
 
-def test_withdraw_application_not_found():
-    client = _make_client()
+def test_withdraw_application_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.post(
         f"/participation/self/v1/applications/{fake_id}/withdrawals",
@@ -1157,8 +1106,7 @@ def test_withdraw_application_not_found():
 # 14. POST /participation/self/v1/applications/{application_id}/resubmissions
 # =============================================================================
 
-def test_request_application_changes_success():
-    client = _make_client()
+def test_request_application_changes_success(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1200,8 +1148,7 @@ def test_request_application_changes_success():
     assert len(cr_events) >= 1
 
 
-def test_patch_application_allowed_during_needs_changes_state():
-    client = _make_client()
+def test_patch_application_allowed_during_needs_changes_state(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1234,8 +1181,7 @@ def test_patch_application_allowed_during_needs_changes_state():
     assert patch_res.json()["answers"]["clarification"] == "Tecnología basada en espirulina"
 
 
-def test_upload_file_allowed_during_needs_changes_state():
-    client = _make_client()
+def test_upload_file_allowed_during_needs_changes_state(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1269,8 +1215,7 @@ def test_upload_file_allowed_during_needs_changes_state():
     assert f_res.json()["state"] == "ready"
 
 
-def test_request_application_changes_allowed_on_resubmitted_application():
-    client = _make_client()
+def test_request_application_changes_allowed_on_resubmitted_application(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1308,8 +1253,7 @@ def test_request_application_changes_allowed_on_resubmitted_application():
     assert cr2.json()["state"] == "needs_changes"
 
 
-def test_request_application_changes_invalid_state():
-    client = _make_client()
+def test_request_application_changes_invalid_state(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1327,8 +1271,7 @@ def test_request_application_changes_invalid_state():
     assert cr_res.json()["code"] == "invalid_state_transition"
 
 
-def test_request_application_changes_not_found():
-    client = _make_client()
+def test_request_application_changes_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.post(
         f"/participation/v1/applications/{fake_id}/change-requests",
@@ -1338,8 +1281,7 @@ def test_request_application_changes_not_found():
     assert res.json()["code"] == "tenant_forbidden"
 
 
-def test_resubmit_application_success_creates_revision_2():
-    client = _make_client()
+def test_resubmit_application_success_creates_revision_2(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1403,8 +1345,7 @@ def test_resubmit_application_success_creates_revision_2():
     assert resub_events[0]["data"]["revision_number"] == 2
 
 
-def test_resubmit_application_stale_revision():
-    client = _make_client()
+def test_resubmit_application_stale_revision(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1434,8 +1375,7 @@ def test_resubmit_application_stale_revision():
     assert resub.json()["code"] == "stale_revision"
 
 
-def test_resubmit_application_invalid_state():
-    client = _make_client()
+def test_resubmit_application_invalid_state(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1454,8 +1394,7 @@ def test_resubmit_application_invalid_state():
     assert resub.json()["code"] == "invalid_state_transition"
 
 
-def test_resubmit_application_blocked_by_quarantined_file():
-    client = _make_client()
+def test_resubmit_application_blocked_by_quarantined_file(client: TestClient):
     payload = _sample_venture_payload()
     res = client.post(
         f"/participation/public/v1/sites/{DEFAULT_SITE_SLUG}/events/{DEFAULT_EVENT_SLUG}/applications",
@@ -1497,8 +1436,7 @@ def test_resubmit_application_blocked_by_quarantined_file():
     assert resub.json()["code"] == "files_not_ready"
 
 
-def test_resubmit_application_not_found():
-    client = _make_client()
+def test_resubmit_application_not_found(client: TestClient):
     fake_id = generate_uuidv7()
     res = client.post(
         f"/participation/self/v1/applications/{fake_id}/resubmissions",
@@ -1513,7 +1451,7 @@ def test_resubmit_application_not_found():
 # 15. Comprehensive End-to-End Lifecycle & Invariants Audit
 # =============================================================================
 
-def test_full_venture_and_application_lifecycle_e2e():
+def test_full_venture_and_application_lifecycle_e2e(client: TestClient):
     """
     Comprehensive E2E test exercising the full lifecycle:
     1. Create draft venture application with leader and 2 invitations.
@@ -1532,7 +1470,6 @@ def test_full_venture_and_application_lifecycle_e2e():
     14. Applicant withdraws application with audit reason (state -> withdrawn).
     15. Verify all outbox domain events were produced and audit trail is intact.
     """
-    client = _make_client()
 
     # Step 1: Create Venture Application
     payload = _sample_venture_payload(

@@ -32,6 +32,9 @@ wheels/
 venv/
 ENV/
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # Node / Web
 node_modules/

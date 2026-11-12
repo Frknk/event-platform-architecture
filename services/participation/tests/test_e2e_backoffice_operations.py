@@ -23,8 +23,6 @@ Covers all 15 Backoffice, Admissibility, Admin, Security, and Demo endpoints:
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from typing import Any, Dict, List, Optional
 import pytest
 from fastapi.testclient import TestClient
@@ -43,32 +41,11 @@ from app.db.database import (
     DEFAULT_ORG_ID,
     DEFAULT_SITE_SLUG,
 )
-from app.main import create_app
 
 
 # =============================================================================
-# Test Fixtures & Helpers
+# Test Helpers (client fixture provided by tests/conftest.py)
 # =============================================================================
-
-def _make_client(*, raise_server_exceptions: bool = True) -> TestClient:
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.close()
-    app = create_app(db_path=tmp.name)
-    client = TestClient(app, raise_server_exceptions=raise_server_exceptions)
-    client._tmp_db_path = tmp.name
-    return client
-
-
-@pytest.fixture
-def client() -> TestClient:
-    c = _make_client()
-    yield c
-    c.app.state.db.close()
-    if hasattr(c, "_tmp_db_path") and os.path.exists(c._tmp_db_path):
-        try:
-            os.unlink(c._tmp_db_path)
-        except OSError:
-            pass
 
 
 def _audit_rows(client: TestClient, *, request_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1100,14 +1077,14 @@ def test_endpoint8_operations_projection_purposes_and_encryption(client: TestCli
     assert "ticket_id" in onsite_items[0]
     assert "name_masked" in onsite_items[0]
 
-    # Verify outbox event emitted
+    # Verify outbox events emitted for both projection purposes (order-independent)
     outbox = client.get("/participation/v1/outbox").json()["items"]
-    proj_evt = next(
-        (e for e in outbox if e["topic"] == "participation.certificate_subject.projected.v1"),
-        None,
-    )
-    assert proj_evt is not None
-    assert proj_evt["envelope"]["data"]["purpose"] == "onsite_attendance"
+    proj_purposes = {
+        e["envelope"]["data"]["purpose"]
+        for e in outbox
+        if e["topic"] == "participation.certificate_subject.projected.v1"
+    }
+    assert {"certificate_issuance", "onsite_attendance"}.issubset(proj_purposes)
 
 
 # =============================================================================
