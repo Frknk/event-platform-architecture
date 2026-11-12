@@ -1228,7 +1228,7 @@ class ParticipationService:
                 cur.execute(
                     """
                     UPDATE capacity_counters
-                    SET waitlist_count = MAX(0, waitlist_count - 1), revision = revision + 1, updated_at = ?
+                    SET waitlist_count = CASE WHEN waitlist_count > 0 THEN waitlist_count - 1 ELSE 0 END, revision = revision + 1, updated_at = ?
                     WHERE event_id = ?
                     """,
                     (now, event_id),
@@ -1321,7 +1321,7 @@ class ParticipationService:
                     cur.execute(
                         """
                         UPDATE capacity_counters
-                        SET waitlist_count = MAX(0, waitlist_count - 1), revision = revision + 1, updated_at = ?
+                        SET waitlist_count = CASE WHEN waitlist_count > 0 THEN waitlist_count - 1 ELSE 0 END, revision = revision + 1, updated_at = ?
                         WHERE event_id = ?
                         """,
                         (now, event_id),
@@ -1355,7 +1355,7 @@ class ParticipationService:
                     cur.execute(
                         """
                         UPDATE capacity_counters
-                        SET confirmed_count = MAX(0, confirmed_count - 1), revision = revision + 1, updated_at = ?
+                        SET confirmed_count = CASE WHEN confirmed_count > 0 THEN confirmed_count - 1 ELSE 0 END, revision = revision + 1, updated_at = ?
                         WHERE event_id = ?
                         """,
                         (now, event_id),

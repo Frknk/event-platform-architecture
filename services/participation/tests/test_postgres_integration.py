@@ -150,6 +150,24 @@ def test_pg_new_tables_and_endpoints(client):
     assert erasure.status_code == 200, erasure.text
     assert erasure.json()["status"] == "erased"
 
+    # Cancellation on PostgreSQL (verifies ANSI SQL capacity counter decrement)
+    reg_cancel = client.post(
+        "/participation/public/v1/sites/incuba-unas/events/congreso-innovacion-demo-day-2026/registrations",
+        json=_registration_payload("pg.cancel@unas.edu.pe"),
+        headers={"Idempotency-Key": f"pg-cancel-{generate_uuidv7()}"},
+    )
+    assert reg_cancel.status_code == 201, reg_cancel.text
+    cancel_res = client.post(
+        f"/participation/self/v1/registrations/{reg_cancel.json()['id']}/cancellations",
+        json={"reason": "No podré asistir"},
+        headers={
+            "Authorization": f"Bearer {reg_cancel.json()['self_service_token']}",
+            "Idempotency-Key": f"pg-cancel-op-{generate_uuidv7()}",
+        },
+    )
+    assert cancel_res.status_code == 200, cancel_res.text
+    assert cancel_res.json()["state"] == "cancelled"
+
 
 def test_pg_import_capacity_guard(client):
     reset = client.post("/participation/v1/demo/reset", json={"capacity": 5})
